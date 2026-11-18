@@ -8,6 +8,7 @@ import {
 	McpHttpError,
 	McpSessionExpiredError,
 	StreamableHttpTransport,
+	TASKS_PROTOCOL_VERSION,
 } from "../src/index.ts";
 import { consumeSseStream, type SseEvent } from "../src/transports/streamable-http.ts";
 import { closeServers, listen, readBody } from "./helpers.ts";
@@ -197,6 +198,59 @@ describe("StreamableHttpTransport", () => {
 		expect(listRequest?.headers["mcp-protocol-version"]).toBe(LATEST_PROTOCOL_VERSION);
 		expect(requests.some((entry) => entry.method === "GET")).toBe(true);
 		expect(requests.some((entry) => entry.method === "DELETE")).toBe(true);
+	});
+
+	it("routes stateless Tasks requests by method and task ID without a legacy session", async () => {
+		const taskId = "=?base64?literal?=";
+		const { url, requests } = await startServer(async (request, response, log) => {
+			const message = JSON.parse(await readBody(request)) as Record<string, unknown>;
+			log.push({ method: request.method ?? "", headers: request.headers, message });
+			const result =
+				message.method === "server/discover"
+					? {
+							resultType: "complete",
+							supportedVersions: [TASKS_PROTOCOL_VERSION],
+							capabilities: { tools: {}, extensions: { "io.modelcontextprotocol/tasks": {} } },
+						}
+					: message.method === "tools/call"
+						? { resultType: "task", taskId, status: "working", pollIntervalMs: 1 }
+						: { resultType: "complete", taskId, status: "completed", result: { structuredContent: "done" } };
+			const reply = JSON.stringify({ jsonrpc: "2.0", id: message.id, result });
+			if (message.method === "tasks/get") {
+				response.writeHead(200, { "content-type": "text/event-stream" });
+				response.end(`data: ${reply}\n\n`);
+			} else {
+				response.writeHead(200, { "content-type": "application/json", "mcp-session-id": "ignore-me" });
+				response.end(reply);
+			}
+		});
+		const client = new McpClient({ name: "http-test", version: "1.0.0", protocolVersion: TASKS_PROTOCOL_VERSION });
+		try {
+			await client.connect(new StreamableHttpTransport({ url }));
+			expect(await client.callTool("hello world")).toEqual({ content: [], structuredContent: "done" });
+		} finally {
+			await client.close();
+		}
+
+		expect(
+			requests.map(({ method, headers }) => [
+				method,
+				headers["mcp-protocol-version"],
+				headers["mcp-method"],
+				headers["mcp-name"],
+				headers["mcp-session-id"],
+			]),
+		).toEqual([
+			["POST", TASKS_PROTOCOL_VERSION, "server/discover", undefined, undefined],
+			["POST", TASKS_PROTOCOL_VERSION, "tools/call", "hello world", undefined],
+			[
+				"POST",
+				TASKS_PROTOCOL_VERSION,
+				"tasks/get",
+				`=?base64?${Buffer.from(taskId).toString("base64")}?=`,
+				undefined,
+			],
+		]);
 	});
 
 	it("classifies authentication failures", async () => {

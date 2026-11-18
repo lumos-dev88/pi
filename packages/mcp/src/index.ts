@@ -1,5 +1,5 @@
 export type { AuthProvider, McpFetch, UnauthorizedContext } from "./auth-provider.ts";
-export { McpClient, type McpClientOptions, type McpRequestOptions } from "./client.ts";
+export { McpClient, type McpClientOptions, type McpConnectionInfo, type McpRequestOptions } from "./client.ts";
 export {
 	isMcpServerOverride,
 	type McpHttpServerConfig,
@@ -69,6 +69,7 @@ export {
 	type ServerCapabilities,
 	SUPPORTED_PROTOCOL_VERSIONS,
 	type SupportedProtocolVersion,
+	TASKS_PROTOCOL_VERSION,
 	type Tool,
 	type ToolAnnotations,
 	type ToolExecution,

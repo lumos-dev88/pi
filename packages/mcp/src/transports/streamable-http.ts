@@ -2,6 +2,7 @@ import type { AuthProvider, McpFetch } from "../auth-provider.ts";
 import {
 	isJsonRpcRequest,
 	isJsonRpcResponse,
+	isObject,
 	JSON_RPC_ERROR_CODES,
 	type JsonRpcId,
 	type JsonRpcMessage,
@@ -10,6 +11,7 @@ import {
 	parseJsonRpcMessage,
 	toError,
 } from "../protocol/jsonrpc.ts";
+import { TASKS_PROTOCOL_VERSION } from "../protocol/types.ts";
 import {
 	DEFAULT_MAX_MESSAGE_BYTES,
 	type McpTransport,
@@ -245,7 +247,27 @@ interface StreamCursor {
 	received: boolean;
 }
 
+function modernRequestHeaders(message: JsonRpcMessage): Record<string, string> {
+	if (!isJsonRpcRequest(message)) return {};
+	const headers: Record<string, string> = { "Mcp-Method": message.method };
+	if (!isObject(message.params)) return headers;
+	const name =
+		message.method === "tasks/get" || message.method === "tasks/update" || message.method === "tasks/cancel"
+			? message.params.taskId
+			: message.method === "resources/read"
+				? message.params.uri
+				: message.method === "tools/call" || message.method === "prompts/get"
+					? message.params.name
+					: undefined;
+	if (typeof name === "string") {
+		const encode = /[^\x20-\x7e\t]/.test(name) || name.trim() !== name || /^=\?base64\?.*\?=$/.test(name);
+		headers["Mcp-Name"] = encode ? `=?base64?${Buffer.from(name).toString("base64")}?=` : name;
+	}
+	return headers;
+}
+
 export class StreamableHttpTransport extends TransportEvents implements McpTransport {
+	readonly modernRequestCancellation = "stream";
 	readonly url: URL;
 	readonly options: Readonly<StreamableHttpTransportOptions>;
 	private fetch: McpFetch;
@@ -284,22 +306,44 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 
 	async send(message: JsonRpcMessage, { signal }: McpTransportSendOptions = {}): Promise<void> {
 		if (!this.started || this.closed) throw new McpConnectionClosedError();
+		const modern = this.protocolVersion === TASKS_PROTOCOL_VERSION;
 		const response = await this.authorizedFetch(
 			"POST",
 			{
-				headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+				headers: {
+					accept: "application/json, text/event-stream",
+					"content-type": "application/json",
+					...(modern ? modernRequestHeaders(message) : undefined),
+				},
 				body: JSON.stringify(message),
 			},
 			signal,
+			modern && signal ? AbortSignal.any([this.controller.signal, signal]) : undefined,
 		);
+		if (modern && !response.ok && response.status !== 401 && isJsonRpcRequest(message)) {
+			const body = (await readBodyText(response, MAX_ERROR_BODY_BYTES).catch(() => ({ text: "" }))).text;
+			if (contentType(response) === "application/json") {
+				let reply: unknown;
+				try {
+					reply = JSON.parse(body);
+				} catch {
+					// Non-MCP HTTP errors keep the existing error type.
+				}
+				if (isJsonRpcResponse(reply) && reply.id === message.id && "error" in reply) {
+					this.emitMessage(reply);
+					return;
+				}
+			}
+			throw new McpHttpError(response.status, describeHttpFailure(response.status, body), body);
+		}
 		await this.checkResponse(response);
-		this.captureSession(response);
+		if (!modern) this.captureSession(response);
 
 		if (!isJsonRpcRequest(message)) {
 			// Notifications and responses are acknowledged with 202 and carry no reply; ignore any body.
 			await discard(response);
 			// The server-to-client stream may only open once the session is initialized.
-			if ("method" in message && message.method === "notifications/initialized") this.startGetStream();
+			if (!modern && "method" in message && message.method === "notifications/initialized") this.startGetStream();
 			return;
 		}
 		if (response.status === 202 || response.status === 204) {
@@ -315,7 +359,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 			return;
 		}
 		if (type === "text/event-stream" && response.body) {
-			void this.consumeResponseStream(response.body, message.id);
+			void this.consumeResponseStream(response.body, message.id, modern ? signal : undefined);
 			return;
 		}
 		await discard(response);
@@ -348,11 +392,13 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 	 * `signal` only stops dispatch: getting a token or the authorization recovery can take a while, and a
 	 * request its sender gave up on in the meantime must not reach the server. It does not abort the shared
 	 * recovery, which other requests may wait for.
+	 * A stateless request additionally supplies a response signal to cancel its own HTTP stream.
 	 */
 	private async authorizedFetch(
 		method: "GET" | "POST",
 		init: { headers: Record<string, string>; body?: string },
 		signal?: AbortSignal,
+		responseSignal = this.controller.signal,
 	): Promise<Response> {
 		const onUnauthorized = this.options.authProvider?.onUnauthorized?.bind(this.options.authProvider);
 		for (let attempt = 0; ; attempt++) {
@@ -362,7 +408,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 				method,
 				headers,
 				body: init.body,
-				signal: this.controller.signal,
+				signal: responseSignal,
 			});
 			if (attempt > 0 || !onUnauthorized || !needsAuthorization(response)) return response;
 			try {
@@ -381,6 +427,11 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 
 	private buildHeaders(extra: Record<string, string>, token: string | undefined): Headers {
 		const headers = new Headers(this.options.headers);
+		if (this.protocolVersion === TASKS_PROTOCOL_VERSION) {
+			headers.delete("Mcp-Session-Id");
+			headers.delete("Mcp-Method");
+			headers.delete("Mcp-Name");
+		}
 		for (const [name, value] of Object.entries(extra)) headers.set(name, value);
 		if (this.sessionIdValue) headers.set("Mcp-Session-Id", this.sessionIdValue);
 		if (this.protocolVersion) headers.set("MCP-Protocol-Version", this.protocolVersion);
@@ -437,7 +488,11 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 	 * arrives and the server assigned event IDs, resume it with GET and `Last-Event-ID`, as the
 	 * server may close response streams at will. Otherwise only this request fails.
 	 */
-	private async consumeResponseStream(body: ReadableStream<Uint8Array>, requestId: JsonRpcId): Promise<void> {
+	private async consumeResponseStream(
+		body: ReadableStream<Uint8Array>,
+		requestId: JsonRpcId,
+		signal?: AbortSignal,
+	): Promise<void> {
 		const cursor: StreamCursor = { lastEventId: undefined, retryMs: undefined, received: false };
 		let answered = false;
 		const onMessage = (message: JsonRpcMessage) => {
@@ -454,7 +509,8 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 					failure = error;
 				}
 			}
-			if (answered || this.closed) return;
+			if (answered || this.closed || signal?.aborted) return;
+			if (this.protocolVersion === TASKS_PROTOCOL_VERSION) break;
 			if (failure !== undefined && !this.isRetryable(failure)) break;
 			if (cursor.lastEventId === undefined || attempt >= this.maxRetries()) break;
 			if (cursor.received) attempt = 0;

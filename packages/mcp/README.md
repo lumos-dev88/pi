@@ -184,7 +184,11 @@ for (const [name, entry] of Object.entries(file.mcpServers)) {
 - OAuth protected-resource and authorization-server discovery
 - PKCE authorization code flow, dynamic client registration, token refresh (one refresh shared by concurrent 401s), and step-up authorization for `insufficient_scope`
 
-Batch JSON-RPC messages, legacy HTTP+SSE, servers, sampling, and tasks are outside the initial core.
+To use the [2026-07-28 Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks), pass `protocolVersion: TASKS_PROTOCOL_VERSION` to `McpClient`. This uses `server/discover` rather than the legacy handshake; the server must support that version. `callTool()` returns the final result in both modes. If the server returns a task handle, the client polls `tasks/get` at the server's suggested interval, reports status with `onProgress`, and sends `tasks/cancel` when the call is aborted. `timeoutMs` is per protocol request, not an overall task deadline.
+
+If a task requests input, `callTool()` uses the declared client capabilities and registered request handlers, deduplicating inputs before sending `tasks/update`. Use `request("tools/call", ...)` and `request("tasks/get", ...)` if you need to manage task handles yourself. Stateless discovery may omit `serverInfo`. This implements the Tasks workflow, not all features of the 2026-07-28 core revision.
+
+Batch JSON-RPC messages, legacy HTTP+SSE, and server implementations are outside this package's scope.
 
 ## Testing
 

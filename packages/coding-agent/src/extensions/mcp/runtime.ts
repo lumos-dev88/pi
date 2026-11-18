@@ -362,6 +362,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		const client = new McpClient({
 			name: "pi",
 			version: VERSION,
+			protocolVersion: this.entry.config.protocolVersion,
 			requestTimeoutMs: this.timeoutMs,
 			roots: [{ uri: pathToFileURL(this.cwd).href, name: basename(this.cwd) }],
 		});

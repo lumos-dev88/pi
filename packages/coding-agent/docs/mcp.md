@@ -66,6 +66,7 @@ HTTP servers use `url`, `headers`, and `oauth` (see [Authenticate with OAuth](#a
 Both server types support:
 
 - `timeout`: per-request timeout in seconds (default 60). Progress notifications reset it.
+- `protocolVersion: "2026-07-28"`: use stateless MCP and enable [Tasks](#asynchronous-tool-tasks) when the server advertises the extension. Omit it for servers using the legacy handshake.
 - `enabled: false`: keep the entry without connecting to it.
 - `exposure` and `toolExposure`: control how tools reach the model (see [Control tool exposure](#control-tool-exposure)).
 - `description`: what the server offers, in a sentence. It lists the server in the system prompt (see [Control tool exposure](#control-tool-exposure)), tool search ranks the server's tools by it, and codemode's `describeNamespace()` returns it. Without it, the first line of the server instructions is used once the server connects.
@@ -82,6 +83,24 @@ Keep personal servers and servers with credentials in the user-level file. Use t
 - Invalid entries are reported and skipped without preventing other servers from connecting.
 
 `pi mcp add` and `pi mcp remove` cover common changes from a shell. See [MCP commands](cli.md#mcp-commands) for their options.
+
+### Asynchronous tool tasks
+
+For a server that implements the [MCP Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks), such as local-vibes, set `protocolVersion` on its full server entry:
+
+```json
+{
+  "mcpServers": {
+    "local-vibes": {
+      "command": "node",
+      "args": ["/absolute/path/to/local-vibes/dist/index.js"],
+      "protocolVersion": "2026-07-28"
+    }
+  }
+}
+```
+
+Pi displays the task ID and status while polling. Concurrent calls have independent task IDs; each tool call still returns the final result. Cancelling a tool call sends `tasks/cancel` after Pi receives a task ID. `timeout` applies to each protocol request, not to the total runtime of a task. Run `pi mcp list` to check the connection.
 
 ### Inspect or change a server
 

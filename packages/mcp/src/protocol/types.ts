@@ -2,11 +2,24 @@ import type { BlobResourceContents, ContentAnnotations, TextResourceContents } f
 import type { JsonRpcId } from "./jsonrpc.ts";
 
 export const LATEST_PROTOCOL_VERSION = "2025-11-25";
+export const TASKS_PROTOCOL_VERSION = "2026-07-28";
+export const TASKS_EXTENSION = "io.modelcontextprotocol/tasks";
+export const PROTOCOL_VERSION_META = "io.modelcontextprotocol/protocolVersion";
+export const CLIENT_CAPABILITIES_META = "io.modelcontextprotocol/clientCapabilities";
+export const CLIENT_INFO_META = "io.modelcontextprotocol/clientInfo";
+export const SERVER_INFO_META = "io.modelcontextprotocol/serverInfo";
+
 /**
- * Versions the client accepts from a server. Servers that do not support the requested version answer
- * with their own latest one, so older versions stay accepted for servers built on older SDKs.
+ * Supported versions across both connection modes. The default handshake still
+ * uses the latest legacy version; stateless MCP is selected explicitly.
  */
-export const SUPPORTED_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"] as const;
+export const SUPPORTED_PROTOCOL_VERSIONS = [
+	TASKS_PROTOCOL_VERSION,
+	LATEST_PROTOCOL_VERSION,
+	"2025-06-18",
+	"2025-03-26",
+	"2024-11-05",
+] as const;
 export type SupportedProtocolVersion = (typeof SUPPORTED_PROTOCOL_VERSIONS)[number];
 
 export interface Implementation {
@@ -25,6 +38,7 @@ export interface ClientCapabilities {
 	roots?: { listChanged?: boolean };
 	sampling?: Record<string, unknown>;
 	elicitation?: Record<string, unknown>;
+	extensions?: Record<string, unknown>;
 }
 
 export interface ServerCapabilities {
@@ -34,6 +48,7 @@ export interface ServerCapabilities {
 	resources?: { subscribe?: boolean; listChanged?: boolean };
 	tools?: { listChanged?: boolean };
 	completions?: Record<string, unknown>;
+	extensions?: Record<string, unknown>;
 }
 
 export interface InitializeParams {

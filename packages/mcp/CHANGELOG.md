@@ -5,6 +5,7 @@
 ### Added
 
 - Added `mcpServerSummary(description, instructions)`, a server's one-line summary for the system prompt as pi's coding agent shows it: the first line of the configured `description`, else of the server's `initialize` instructions.
+- Added opt-in MCP Tasks for protocol `2026-07-28`. The client follows task handles to completion, reports progress, handles task input through registered handlers, and sends cooperative cancellation. The default legacy handshake is unchanged.
 
 ## [1.5.2] - 2026-11-10
 

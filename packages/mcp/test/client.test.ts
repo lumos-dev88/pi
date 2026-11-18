@@ -5,10 +5,20 @@ import {
 	LATEST_PROTOCOL_VERSION,
 	McpAbortError,
 	McpClient,
+	type McpClientOptions,
+	McpConnectionClosedError,
 	McpError,
 	McpTimeoutError,
+	TASKS_PROTOCOL_VERSION,
 } from "../src/index.ts";
 import { createInMemoryTransportPair, type InMemoryTransport } from "../src/testing/index.ts";
+
+const tasksExtension = "io.modelcontextprotocol/tasks";
+const metadata = {
+	"io.modelcontextprotocol/protocolVersion": TASKS_PROTOCOL_VERSION,
+	"io.modelcontextprotocol/clientInfo": { name: "test-client", version: "2.0.0" },
+};
+const tasksCapabilities = { extensions: { [tasksExtension]: {} } };
 
 interface TestServer {
 	transport: InMemoryTransport;
@@ -26,17 +36,22 @@ async function createServer(): Promise<{ clientTransport: InMemoryTransport; ser
 		const request = message as JsonRpcRequest;
 		const handler = handlers.get(request.method);
 		queueMicrotask(async () => {
+			let reply: JsonRpcMessage;
 			try {
 				if (!handler) throw new McpError(-32601, `Method not found: ${request.method}`);
-				await pair.server.send({ jsonrpc: "2.0", id: request.id, result: await handler(request) });
+				reply = { jsonrpc: "2.0", id: request.id, result: await handler(request) };
 			} catch (error) {
 				const mcpError = error instanceof McpError ? error : new McpError(-32603, String(error));
-				await pair.server.send({
+				reply = {
 					jsonrpc: "2.0",
 					id: request.id,
 					error: { code: mcpError.code, message: mcpError.message, data: mcpError.data },
-				});
+				};
 			}
+			await pair.server.send(reply).catch((error) => {
+				// The client can close immediately after it has sent a cooperative cancellation.
+				if (!(error instanceof McpConnectionClosedError)) throw error;
+			});
 		});
 	});
 	await pair.server.start();
@@ -62,6 +77,228 @@ async function connect(): Promise<{ client: McpClient; server: TestServer }> {
 	await client.connect(clientTransport);
 	return { client, server };
 }
+
+async function connectModern(
+	options?: Partial<McpClientOptions>,
+	extensions: Record<string, unknown> = tasksCapabilities.extensions,
+) {
+	const { clientTransport, server } = await createServer();
+	server.setHandler("server/discover", () => ({
+		resultType: "complete",
+		supportedVersions: [TASKS_PROTOCOL_VERSION],
+		capabilities: { tools: {}, extensions },
+		_meta: { "io.modelcontextprotocol/serverInfo": { name: "modern-server", version: "1.0.0" } },
+	}));
+	const client = new McpClient({
+		name: "test-client",
+		version: "2.0.0",
+		protocolVersion: TASKS_PROTOCOL_VERSION,
+		...options,
+	});
+	await client.connect(clientTransport);
+	return { client, server };
+}
+
+describe("MCP Tasks", () => {
+	it("polls two task handles independently and preserves both final results and progress", async () => {
+		const { client, server } = await connectModern();
+		try {
+			expect(client.serverInfo?.name).toBe("modern-server");
+			expect(server.messages).toEqual([
+				{
+					jsonrpc: "2.0",
+					id: 1,
+					method: "server/discover",
+					params: {
+						_meta: { ...metadata, "io.modelcontextprotocol/clientCapabilities": { extensions: {} } },
+					},
+				},
+			]);
+
+			const started = new Set<string>();
+			server.setHandler("tools/call", ({ params }) => {
+				const { name, _meta } = params as { name: string; _meta: unknown };
+				expect(_meta).toMatchObject({
+					...metadata,
+					"io.modelcontextprotocol/clientCapabilities": tasksCapabilities,
+				});
+				started.add(name);
+				return { resultType: "task", taskId: name, status: "working", statusMessage: "queued", pollIntervalMs: 1 };
+			});
+			const polled = new Set<string>();
+			server.setHandler("tasks/get", ({ params }) => {
+				const { taskId, _meta } = params as { taskId: string; _meta: unknown };
+				expect(started).toEqual(new Set(["first", "second"]));
+				expect(_meta).toEqual({ ...metadata, "io.modelcontextprotocol/clientCapabilities": tasksCapabilities });
+				const common = { resultType: "complete", taskId, pollIntervalMs: 1 };
+				if (!polled.has(taskId)) {
+					polled.add(taskId);
+					return { ...common, status: "working", statusMessage: "running" };
+				}
+				return {
+					...common,
+					status: "completed",
+					result: { content: [{ type: "text", text: taskId }], isError: taskId === "second" },
+				};
+			});
+			const firstProgress = vi.fn();
+			const secondProgress = vi.fn();
+			const result = await Promise.all([
+				client.callTool("first", {}, { onProgress: firstProgress }),
+				client.callTool("second", {}, { onProgress: secondProgress }),
+			]);
+			expect(result).toEqual([
+				{ content: [{ type: "text", text: "first" }], isError: false },
+				{ content: [{ type: "text", text: "second" }], isError: true },
+			]);
+			expect(firstProgress.mock.calls.map(([event]) => event.message)).toEqual([
+				"Task first: queued",
+				"Task first: running",
+			]);
+			expect(secondProgress.mock.calls.map(([event]) => event.message)).toEqual([
+				"Task second: queued",
+				"Task second: running",
+			]);
+		} finally {
+			await client.close();
+		}
+	});
+
+	it("uses stateless requests without Tasks when the server does not advertise it", async () => {
+		const { client, server } = await connectModern({}, {});
+		try {
+			server.setHandler("tools/call", ({ params }) => {
+				expect(params).toMatchObject({
+					_meta: { ...metadata, "io.modelcontextprotocol/clientCapabilities": { extensions: {} } },
+				});
+				return { resultType: "complete", structuredContent: 3 };
+			});
+			expect((await client.callTool("immediate")).structuredContent).toBe(3);
+			server.setHandler("tools/call", () => ({ resultType: "task", taskId: "unexpected", status: "working" }));
+			await expect(client.callTool("unexpected")).rejects.toThrow("Unexpected MCP tools/call resultType: task");
+		} finally {
+			await client.close();
+		}
+	});
+
+	it("delivers each task input request once and retrieves the result", async () => {
+		const root = { uri: "file:///workspace", name: "workspace" };
+		const { client, server } = await connectModern({ roots: [root] });
+		try {
+			server.setHandler("tools/call", () => ({
+				resultType: "task",
+				taskId: "needs-roots",
+				status: "input_required",
+				pollIntervalMs: 1,
+			}));
+			let polls = 0;
+			server.setHandler("tasks/get", () => {
+				const common = { resultType: "complete", taskId: "needs-roots", pollIntervalMs: 1 };
+				return ++polls <= 2
+					? { ...common, status: "input_required", inputRequests: { roots: { method: "roots/list" } } }
+					: { ...common, status: "completed", result: { content: [{ type: "text", text: "used the root" }] } };
+			});
+			const updates = vi.fn(({ params }: JsonRpcRequest) => {
+				expect(params).toMatchObject({ taskId: "needs-roots", inputResponses: { roots: { roots: [root] } } });
+				return { resultType: "complete" };
+			});
+			server.setHandler("tasks/update", updates);
+			expect(await client.callTool("roots")).toEqual({ content: [{ type: "text", text: "used the root" }] });
+			expect(updates).toHaveBeenCalledTimes(1);
+		} finally {
+			await client.close();
+		}
+	});
+
+	it("cancels the task by ID when aborted during the delay between polls", async () => {
+		const { client, server } = await connectModern();
+		try {
+			server.setHandler("tools/call", () => ({
+				resultType: "task",
+				taskId: "slow",
+				status: "working",
+				pollIntervalMs: 60_000,
+			}));
+			const cancellation = Promise.withResolvers<unknown>();
+			server.setHandler("tasks/cancel", ({ params }) => {
+				cancellation.resolve(params);
+				return { resultType: "complete" };
+			});
+			const controller = new AbortController();
+			const running = Promise.withResolvers<void>();
+			const call = client.callTool("slow", {}, { signal: controller.signal, onProgress: () => running.resolve() });
+			await running.promise;
+			controller.abort();
+			await expect(call).rejects.toBeInstanceOf(McpAbortError);
+			expect(await cancellation.promise).toMatchObject({ taskId: "slow" });
+			expect(server.messages.filter((message) => "method" in message).map((message) => message.method)).toEqual([
+				"server/discover",
+				"tools/call",
+				"tasks/cancel",
+			]);
+		} finally {
+			await client.close();
+		}
+	});
+
+	it("cancels a handle that arrives after its originating request was aborted", async () => {
+		const { client, server } = await connectModern();
+		try {
+			const started = Promise.withResolvers<void>();
+			const handle = Promise.withResolvers<unknown>();
+			server.setHandler("tools/call", () => {
+				started.resolve();
+				return handle.promise;
+			});
+			const cancelled = Promise.withResolvers<unknown>();
+			server.setHandler("tasks/cancel", ({ params }) => {
+				cancelled.resolve(params);
+				return { resultType: "complete" };
+			});
+			const controller = new AbortController();
+			const call = client.callTool("late", {}, { signal: controller.signal });
+			await started.promise;
+			controller.abort();
+			await expect(call).rejects.toBeInstanceOf(McpAbortError);
+			handle.resolve({ resultType: "task", taskId: "late", status: "working" });
+			expect(await cancelled.promise).toMatchObject({ taskId: "late" });
+		} finally {
+			await client.close();
+		}
+	});
+
+	it("surfaces task errors and rejects when a connection closes while waiting to poll", async () => {
+		const { client, server } = await connectModern();
+		try {
+			server.setHandler("tools/call", () => ({ resultType: "task", taskId: "fail", status: "failed" }));
+			server.setHandler("tasks/get", () => ({
+				resultType: "complete",
+				status: "failed",
+				taskId: "fail",
+				error: { code: -32603, message: "internal task error", data: { reason: "backend" } },
+			}));
+			await expect(client.callTool("fail")).rejects.toMatchObject({
+				code: -32603,
+				message: "internal task error",
+				data: { reason: "backend" },
+			});
+			server.setHandler("tools/call", () => ({
+				resultType: "task",
+				taskId: "slow",
+				status: "working",
+				pollIntervalMs: 60_000,
+			}));
+			const running = Promise.withResolvers<void>();
+			const call = client.callTool("slow", {}, { onProgress: () => running.resolve() });
+			await running.promise;
+			const rejects = expect(call).rejects.toBeInstanceOf(McpConnectionClosedError);
+			await client.close();
+			await rejects;
+		} finally {
+			await client.close();
+		}
+	});
+});
 
 afterEach(() => {
 	vi.useRealTimers();

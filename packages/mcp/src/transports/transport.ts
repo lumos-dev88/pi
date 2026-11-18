@@ -16,6 +16,8 @@ export interface McpTransportSendOptions {
 }
 
 export interface McpTransport {
+	/** Stateless HTTP cancels a request by closing its response stream, not by sending a notification. */
+	readonly modernRequestCancellation?: "stream";
 	start(): Promise<void>;
 	send(message: JsonRpcMessage, options?: McpTransportSendOptions): Promise<void>;
 	close(): Promise<void>;

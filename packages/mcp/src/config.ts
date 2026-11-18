@@ -16,6 +16,8 @@
  * for the caller to check afterwards.
  */
 
+import { SUPPORTED_PROTOCOL_VERSIONS, type SupportedProtocolVersion } from "./protocol/types.ts";
+
 /** Fields every server entry may have. */
 interface McpServerConfigBase {
 	/** What the server offers, in a sentence. */
@@ -24,6 +26,8 @@ interface McpServerConfigBase {
 	enabled?: boolean;
 	/** Per-request timeout in seconds. */
 	timeout?: number;
+	/** Select stateless MCP with "2026-07-28"; otherwise use the legacy handshake. */
+	protocolVersion?: SupportedProtocolVersion;
 }
 
 /** A server started as a local program that speaks MCP over stdin and stdout. */
@@ -143,11 +147,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function validateBaseFields(entry: Record<string, unknown>): string | undefined {
-	const { enabled, timeout, description } = entry;
+	const { enabled, timeout, description, protocolVersion } = entry;
 	if (enabled !== undefined && typeof enabled !== "boolean") return "enabled must be a boolean";
 	if (description !== undefined && typeof description !== "string") return "description must be a string";
 	if (timeout !== undefined && (typeof timeout !== "number" || !(timeout > 0))) {
 		return "timeout must be a positive number of seconds";
+	}
+	if (protocolVersion !== undefined && !SUPPORTED_PROTOCOL_VERSIONS.some((version) => version === protocolVersion)) {
+		return `protocolVersion must be one of ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}`;
 	}
 	return undefined;
 }

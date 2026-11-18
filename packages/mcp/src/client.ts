@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import type { CallToolResult } from "./protocol/content.ts";
 import {
 	isJsonRpcId,
@@ -16,21 +17,28 @@ import {
 	McpTimeoutError,
 	toError,
 } from "./protocol/jsonrpc.ts";
+import { readTaskSnapshot, type TaskHandle, type TaskSnapshot } from "./protocol/tasks.ts";
 import {
+	CLIENT_CAPABILITIES_META,
+	CLIENT_INFO_META,
 	type ClientCapabilities,
 	type Implementation,
 	type InitializeResult,
 	LATEST_PROTOCOL_VERSION,
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
+	PROTOCOL_VERSION_META,
 	type ProgressNotification,
 	type ReadResourceResult,
 	type Resource,
 	type ResourceTemplate,
 	type Root,
+	SERVER_INFO_META,
 	type ServerCapabilities,
 	SUPPORTED_PROTOCOL_VERSIONS,
 	type SupportedProtocolVersion,
+	TASKS_EXTENSION,
+	TASKS_PROTOCOL_VERSION,
 	type Tool,
 } from "./protocol/types.ts";
 import type { McpTransport } from "./transports/transport.ts";
@@ -57,6 +65,15 @@ export interface McpRequestOptions {
 	onProgress?: (progress: ProgressNotification) => void;
 }
 
+/** Connection information; stateless servers may omit their identity. */
+export type McpConnectionInfo = Omit<InitializeResult, "serverInfo"> & { serverInfo?: Implementation };
+
+interface ModernMetadata extends Record<string, unknown> {
+	[PROTOCOL_VERSION_META]: typeof TASKS_PROTOCOL_VERSION;
+	[CLIENT_CAPABILITIES_META]: ClientCapabilities;
+	[CLIENT_INFO_META]: Implementation;
+}
+
 interface PendingRequest {
 	resolve: (value: unknown) => void;
 	reject: (reason: unknown) => void;
@@ -66,6 +83,7 @@ interface PendingRequest {
 	onAbort: () => void;
 	/** Aborted when the request settles, so the transport does not dispatch (or retry) it afterwards. */
 	sendController: AbortController;
+	mayCreateTask: boolean;
 	cancellable: boolean;
 	onProgress: ((progress: ProgressNotification) => void) | undefined;
 	progressToken: JsonRpcId | undefined;
@@ -88,6 +106,29 @@ function validateInitializeResult(value: unknown): InitializeResult {
 
 function invalid(message: string): McpError {
 	return new McpError(JSON_RPC_ERROR_CODES.invalidRequest, message);
+}
+
+function validateDiscoverResult(value: unknown): McpConnectionInfo {
+	if (
+		!isObject(value) ||
+		value.resultType !== "complete" ||
+		!Array.isArray(value.supportedVersions) ||
+		!value.supportedVersions.includes(TASKS_PROTOCOL_VERSION) ||
+		!isObject(value.capabilities) ||
+		(value.instructions !== undefined && typeof value.instructions !== "string")
+	) {
+		throw invalid(`Invalid MCP server/discover result or server does not support ${TASKS_PROTOCOL_VERSION}`);
+	}
+	const info = isObject(value._meta) ? value._meta[SERVER_INFO_META] : undefined;
+	if (info !== undefined && (!isObject(info) || typeof info.name !== "string" || typeof info.version !== "string")) {
+		throw invalid("Invalid MCP server/discover server identity");
+	}
+	return {
+		protocolVersion: TASKS_PROTOCOL_VERSION,
+		capabilities: value.capabilities,
+		serverInfo: info as Implementation | undefined,
+		instructions: value.instructions,
+	};
 }
 
 /** One page of a paginated list: the items under `key`, each checked by `isItem`. */
@@ -147,7 +188,10 @@ function validateReadResourceResult(value: unknown): ReadResourceResult {
  */
 function validateCallToolResult(value: unknown): CallToolResult {
 	if (!isObject(value) || (value.content !== undefined && !Array.isArray(value.content))) {
-		throw new McpError(JSON_RPC_ERROR_CODES.invalidRequest, "Invalid MCP tools/call result");
+		throw invalid("Invalid MCP tools/call result");
+	}
+	if (value.resultType !== undefined && value.resultType !== "complete") {
+		throw invalid(`Unexpected MCP tools/call resultType: ${String(value.resultType)}`);
 	}
 	return (value.content === undefined ? { ...value, content: [] } : value) as unknown as CallToolResult;
 }
@@ -161,6 +205,9 @@ export class McpClient {
 	private serverCapabilitiesValue: ServerCapabilities | undefined;
 	private instructionsValue: string | undefined;
 	private protocolVersionValue: string | undefined;
+	private modernMetadata: ModernMetadata | undefined;
+	private tasks: { metadata: ModernMetadata; lifetime: AbortController } | undefined;
+	private lateTasks: Map<JsonRpcId, NodeJS.Timeout> | undefined;
 	private pending = new Map<JsonRpcId, PendingRequest>();
 	private progressRequests = new Map<JsonRpcId, JsonRpcId>();
 	private incoming = new Map<JsonRpcId, AbortController>();
@@ -201,7 +248,7 @@ export class McpClient {
 		return this.protocolVersionValue;
 	}
 
-	async connect(transport: McpTransport): Promise<InitializeResult> {
+	async connect(transport: McpTransport): Promise<McpConnectionInfo> {
 		if (this.state !== "idle") throw new Error(`Cannot connect MCP client in ${this.state} state`);
 		this.state = "connecting";
 		this.transport = transport;
@@ -216,31 +263,61 @@ export class McpClient {
 			await transport.start();
 			const capabilities: ClientCapabilities = { ...this.options.capabilities };
 			if (this.options.roots && capabilities.roots === undefined) capabilities.roots = {};
-			const result = validateInitializeResult(
-				await this.requestInternal(
-					"initialize",
-					{
-						protocolVersion: this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION,
-						capabilities,
-						clientInfo: {
-							name: this.options.name,
-							version: this.options.version,
-							...(this.options.title === undefined ? {} : { title: this.options.title }),
+			const clientInfo: Implementation = {
+				name: this.options.name,
+				version: this.options.version,
+				...(this.options.title === undefined ? {} : { title: this.options.title }),
+			};
+			const preferredVersion = this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION;
+			const modern = preferredVersion === TASKS_PROTOCOL_VERSION;
+			let result: McpConnectionInfo;
+			if (modern) {
+				const { [TASKS_EXTENSION]: _tasks, ...extensions } = capabilities.extensions ?? {};
+				capabilities.extensions = extensions;
+				this.modernMetadata = {
+					[PROTOCOL_VERSION_META]: TASKS_PROTOCOL_VERSION,
+					[CLIENT_INFO_META]: clientInfo,
+					[CLIENT_CAPABILITIES_META]: capabilities,
+				};
+				transport.setProtocolVersion?.(TASKS_PROTOCOL_VERSION);
+				result = validateDiscoverResult(await this.requestInternal("server/discover", undefined, {}, true));
+				const serverExtensions = result.capabilities.extensions;
+				if (isObject(serverExtensions) && Object.hasOwn(serverExtensions, TASKS_EXTENSION)) {
+					this.tasks = {
+						metadata: {
+							...this.modernMetadata,
+							[CLIENT_CAPABILITIES_META]: {
+								...capabilities,
+								extensions: { ...extensions, [TASKS_EXTENSION]: {} },
+							},
 						},
-					},
-					{},
-					true,
-				),
-			);
-			if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) {
-				throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
+						lifetime: new AbortController(),
+					};
+				}
+			} else {
+				result = validateInitializeResult(
+					await this.requestInternal(
+						"initialize",
+						{ protocolVersion: preferredVersion, capabilities, clientInfo },
+						{},
+						true,
+					),
+				);
+				if (
+					result.protocolVersion === TASKS_PROTOCOL_VERSION ||
+					!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)
+				) {
+					throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
+				}
 			}
 			this.protocolVersionValue = result.protocolVersion;
 			this.serverInfoValue = result.serverInfo;
 			this.serverCapabilitiesValue = result.capabilities;
 			this.instructionsValue = result.instructions;
-			transport.setProtocolVersion?.(result.protocolVersion);
-			await this.notifyInternal("notifications/initialized", undefined, true);
+			if (!modern) {
+				transport.setProtocolVersion?.(result.protocolVersion);
+				await this.notifyInternal("notifications/initialized", undefined, true);
+			}
 			this.state = "connected";
 			return result;
 		} catch (error) {
@@ -380,9 +457,103 @@ export class McpClient {
 		args?: Record<string, unknown>,
 		options: McpRequestOptions = {},
 	): Promise<CallToolResult> {
-		return validateCallToolResult(
-			await this.request("tools/call", { name, ...(args === undefined ? {} : { arguments: args }) }, options),
-		);
+		const params = { name, ...(args === undefined ? {} : { arguments: args }) };
+		const result = await this.request("tools/call", params, options);
+		if (this.tasks && isObject(result) && result.resultType === "task") {
+			return this.finishTask(readTaskSnapshot(result, "task"), options, this.tasks.lifetime.signal);
+		}
+		return validateCallToolResult(result);
+	}
+
+	private async finishTask(
+		handle: TaskHandle,
+		options: McpRequestOptions,
+		lifetime: AbortSignal,
+	): Promise<CallToolResult> {
+		const signal = options.signal ? AbortSignal.any([lifetime, options.signal]) : lifetime;
+		const requestOptions = { signal, timeoutMs: options.timeoutMs };
+		const { taskId } = handle;
+		let task: TaskHandle | TaskSnapshot = handle;
+		let lastProgress: string | undefined;
+		let progress = 0;
+		let answered: Set<string> | undefined;
+		try {
+			for (;;) {
+				if (signal.aborted) throw signal.reason;
+				if (task.resultType === "complete") {
+					switch (task.status) {
+						case "completed":
+							return validateCallToolResult(task.result);
+						case "failed":
+							throw task.error;
+						case "cancelled":
+							throw new McpAbortError(task.statusMessage ?? `MCP task ${taskId} was cancelled`);
+					}
+				}
+				if (options.onProgress) {
+					const message = `Task ${taskId}: ${task.statusMessage ?? task.status}`;
+					if (message !== lastProgress) {
+						lastProgress = message;
+						try {
+							options.onProgress({ progressToken: taskId, progress: ++progress, message });
+						} catch (error) {
+							this.emitError(error);
+						}
+					}
+				}
+				if (task.resultType === "complete" && task.status === "input_required") {
+					answered ??= new Set();
+					const inputResponses = await this.answerTaskInputs(task.inputRequests, answered, signal);
+					if (Object.keys(inputResponses).length) {
+						await this.request("tasks/update", { taskId, inputResponses }, requestOptions);
+					}
+				}
+				// Only tasks/get returns the payload, even if the handle already reports a terminal state.
+				if (task.resultType === "complete" || task.status === "working") {
+					await sleep(task.pollIntervalMs, undefined, { signal });
+				}
+				task = readTaskSnapshot(await this.request("tasks/get", { taskId }, requestOptions), "complete", taskId);
+			}
+		} catch (error) {
+			if ((task.status === "working" || task.status === "input_required") && this.state === "connected") {
+				this.cancelTask(taskId);
+			}
+			if (lifetime.aborted) throw lifetime.reason;
+			if (options.signal?.aborted) throw new McpAbortError();
+			throw error;
+		}
+	}
+
+	private async answerTaskInputs(
+		requests: Record<string, unknown>,
+		answered: Set<string>,
+		signal: AbortSignal,
+	): Promise<Record<string, unknown>> {
+		const metadata = this.tasks?.metadata[CLIENT_CAPABILITIES_META];
+		const responses: Record<string, unknown> = Object.create(null);
+		for (const [id, request] of Object.entries(requests)) {
+			if (answered.has(id)) continue;
+			signal.throwIfAborted();
+			if (!isObject(request) || typeof request.method !== "string") throw invalid("Invalid MCP task input request");
+			const capability =
+				request.method === "roots/list"
+					? metadata?.roots
+					: request.method === "sampling/createMessage"
+						? metadata?.sampling
+						: request.method === "elicitation/create"
+							? metadata?.elicitation
+							: undefined;
+			const handler = capability && this.requestHandlers.get(request.method);
+			if (!handler) throw invalid(`Unsupported MCP task input method: ${request.method}`);
+			responses[id] = (await handler(request.params, { signal })) ?? {};
+			answered.add(id);
+		}
+		return responses;
+	}
+
+	private cancelTask(taskId: string): void {
+		// Cancellation is cooperative. Do not hold up the caller or use its already aborted signal.
+		void this.request("tasks/cancel", { taskId }, { timeoutMs: 1_000 }).catch(() => {});
 	}
 
 	async close(): Promise<void> {
@@ -403,10 +574,21 @@ export class McpClient {
 		if (options.signal?.aborted) throw new McpAbortError();
 		const id = this.nextRequestId++;
 		const progressToken = options.onProgress ? id : undefined;
+		const metadata =
+			this.tasks && (method === "tools/call" || method.startsWith("tasks/"))
+				? this.tasks.metadata
+				: this.modernMetadata;
 		const requestParams =
-			progressToken === undefined
+			metadata === undefined && progressToken === undefined
 				? params
-				: { ...params, _meta: { ...(isObject(params?._meta) ? params._meta : {}), progressToken } };
+				: {
+						...params,
+						_meta: {
+							...(isObject(params?._meta) ? params._meta : {}),
+							...metadata,
+							...(progressToken === undefined ? {} : { progressToken }),
+						},
+					};
 		const message: JsonRpcRequest = {
 			jsonrpc: "2.0",
 			id,
@@ -430,6 +612,7 @@ export class McpClient {
 					),
 				sendController: new AbortController(),
 				cancellable: method !== "initialize",
+				mayCreateTask: this.tasks !== undefined && method === "tools/call",
 				onProgress: options.onProgress,
 				progressToken,
 			};
@@ -481,7 +664,20 @@ export class McpClient {
 	private handleResponse(message: JsonRpcResponse): void {
 		const entry = this.pending.get(message.id);
 		if (!entry) {
-			this.emitError(new Error(`Received response for unknown MCP request ${String(message.id)}`));
+			const timer = this.lateTasks?.get(message.id);
+			if (timer) {
+				clearTimeout(timer);
+				this.lateTasks?.delete(message.id);
+				if ("result" in message && isObject(message.result) && message.result.resultType === "task") {
+					try {
+						this.cancelTask(readTaskSnapshot(message.result, "task").taskId);
+					} catch (error) {
+						this.emitError(error);
+					}
+				}
+			} else {
+				this.emitError(new Error(`Received response for unknown MCP request ${String(message.id)}`));
+			}
 			return;
 		}
 		this.removePending(message.id, entry);
@@ -561,10 +757,19 @@ export class McpClient {
 	private cancelPending(id: JsonRpcId, error: unknown, notifyServer: boolean, reason?: string): void {
 		const entry = this.pending.get(id);
 		if (!entry) return;
+		const transport = this.transport;
+		const streamCancellation = this.modernMetadata && transport?.modernRequestCancellation === "stream";
+		if (notifyServer && entry.mayCreateTask && !streamCancellation) {
+			// Over stdio, the task handle can still arrive after the original request was cancelled.
+			this.lateTasks ??= new Map();
+			const lateTasks = this.lateTasks;
+			const timer = setTimeout(() => lateTasks.delete(id), DEFAULT_REQUEST_TIMEOUT_MS).unref();
+			lateTasks.set(id, timer);
+		}
 		this.removePending(id, entry);
 		entry.reject(error);
-		if (notifyServer && this.transport) {
-			void this.transport
+		if (notifyServer && transport && !streamCancellation) {
+			void transport
 				.send({
 					jsonrpc: "2.0",
 					method: "notifications/cancelled",
@@ -597,6 +802,11 @@ export class McpClient {
 	private markClosed(error: Error): void {
 		const wasClosed = this.state === "closed";
 		this.state = "closed";
+		this.tasks?.lifetime.abort(error);
+		if (this.lateTasks) {
+			for (const timer of this.lateTasks.values()) clearTimeout(timer);
+			this.lateTasks.clear();
+		}
 		this.rejectPending(error);
 		for (const controller of this.incoming.values()) controller.abort(error);
 		this.incoming.clear();

@@ -154,7 +154,7 @@ describe("AgentSession MCP OAuth", () => {
 	}
 
 	// #10565
-	it("closes the session without refreshing an expiring token", async () => {
+	it("shuts down without sending an MCP request or refreshing an expiring token", async () => {
 		const { harness, server, notifications, backend } = await setup("follow");
 		await harness.session.prompt("/mcp login issues");
 		expect(notifications.at(-1)).toBe('Signed in to MCP server "issues" (1 tools).');
@@ -165,10 +165,13 @@ describe("AgentSession MCP OAuth", () => {
 			return { result: undefined, next: JSON.stringify(states) };
 		});
 		server.stall.add("/token");
+		const methodsBeforeShutdown = [...server.mcpMethods];
+		expect(methodsBeforeShutdown.length).toBeGreaterThan(0);
+		expect(methodsBeforeShutdown.every((method) => method === "POST")).toBe(true);
 
 		expect(await shutdown(harness)).toBeLessThan(2_000);
 		expect(server.stalled).toEqual([]);
-		expect(server.deletes).toEqual(["access-1"]);
+		expect(server.mcpMethods).toEqual(methodsBeforeShutdown);
 	});
 
 	async function freePort(): Promise<number> {

@@ -309,7 +309,7 @@ so it gets a transport over an abstract pipe that `RemoteProcess` satisfies with
   limit, an incomplete message at exit, `send` after close, the shutdown order (stdin closed first; `close()` only after
   the timeout; not at all when the program exits in time), `start` rejecting when `open` rejects;
 - end to end: a `McpClient` over `PipeTransport` whose `open` spawns `test/fixtures/stdio-server.mjs` with
-  `node:child_process` (a 20-line adapter in the test) completes `initialize`, `tools/list` and `tools/call`.
+  `node:child_process` (a 20-line adapter in the test) completes `server/discover`, `tools/list` and `tools/call`.
 
 **Done when:** tests pass, `test/stdio.test.ts` unchanged and green, `npm run check` clean, README and changelog
 updated. pi-mcp still has no dependency on pi-env.
@@ -669,7 +669,7 @@ the redirect back (section 14).
 **Where:** `apps/p2/plugins/codemode/` (namespaces), `apps/p2/plugins/mcp/`.
 
 - **Namespaces:** one `CodemodeNamespace` per server (`name` = server, `prefix` = `mcpNamespace(server) + "__"`,
-  `description` from the server's `instructions` in `initialize`, if any) fed into `createCodemodeExtension` from the
+  `description` from the server's discovery instructions, if any) fed into `createCodemodeExtension` from the
   `servers` state, through a registry the MCP plugin contributes to or a getter read at use (as codemode already does for
   its sandbox).
 - **Progress:** Chord calls return one result. Default: no MCP progress in the first version. If wanted: the manager

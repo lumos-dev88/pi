@@ -4,7 +4,7 @@ Pi connects to [Model Context Protocol](https://modelcontextprotocol.io) servers
 
 ## Quick setup
 
-Add a local stdio server, check the connection, then start Pi:
+Add a local stdio server that supports MCP `2026-07-28`, check the connection, then start Pi:
 
 ```bash
 pi mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
@@ -66,7 +66,6 @@ HTTP servers use `url`, `headers`, and `oauth` (see [Authenticate with OAuth](#a
 Both server types support:
 
 - `timeout`: per-request timeout in seconds (default 60). Progress notifications reset it.
-- `protocolVersion: "2026-07-28"`: use stateless MCP and enable [Tasks](#asynchronous-tool-tasks) when the server advertises the extension. Omit it for servers using the legacy handshake.
 - `enabled: false`: keep the entry without connecting to it.
 - `exposure` and `toolExposure`: control how tools reach the model (see [Control tool exposure](#control-tool-exposure)).
 - `description`: what the server offers, in a sentence. It lists the server in the system prompt (see [Control tool exposure](#control-tool-exposure)), tool search ranks the server's tools by it, and codemode's `describeNamespace()` returns it. Without it, the first line of the server instructions is used once the server connects.
@@ -86,15 +85,14 @@ Keep personal servers and servers with credentials in the user-level file. Use t
 
 ### Asynchronous tool tasks
 
-For a server that implements the [MCP Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks), such as local-vibes, set `protocolVersion` on its full server entry:
+Pi requires MCP `2026-07-28` and uses [MCP Tasks](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks) automatically when the server advertises it. No extra configuration is needed. For example:
 
 ```json
 {
   "mcpServers": {
     "local-vibes": {
       "command": "node",
-      "args": ["/absolute/path/to/local-vibes/dist/index.js"],
-      "protocolVersion": "2026-07-28"
+      "args": ["/absolute/path/to/local-vibes/dist/index.js"]
     }
   }
 }
@@ -256,7 +254,7 @@ Codemode scripts receive the complete MCP `CallToolResult`, including `content`,
 
 ## Use resources
 
-When a connected server offers [resources](https://modelcontextprotocol.io/specification/2025-11-25/server/resources), Pi adds the resource tools used by Codex and OpenCode:
+When a connected server offers [resources](https://modelcontextprotocol.io/specification/2026-07-28/server/resources), Pi adds the resource tools used by Codex and OpenCode:
 
 - `list_mcp_resources` lists resources as JSON: `{ server?, resources: [{ server, uri, name, ... }], nextCursor? }`. With `server`, it lists one page; `cursor` continues with the next page. Without `server`, it lists every resource from every server.
 - `list_mcp_resource_templates` lists URI templates for resources the servers do not list directly.

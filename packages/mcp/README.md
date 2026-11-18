@@ -27,7 +27,7 @@ await client.close();
 
 For a remote server, use `new StreamableHttpTransport({ url, headers })`. Fetch can be injected for proxying or custom networking.
 
-An MCP transport owns framing and I/O. It delivers individual JSON-RPC messages to `McpClient`; the client owns request correlation, initialization, timeouts, cancellation, server requests, and protocol-level helpers.
+An MCP transport owns framing and I/O. It delivers individual JSON-RPC messages to `McpClient`; the client owns request correlation, discovery, timeouts, cancellation, and task polling.
 
 ### Stdio servers started elsewhere
 
@@ -169,22 +169,19 @@ for (const [name, entry] of Object.entries(file.mcpServers)) {
 
 ## Supported protocol surface
 
-- MCP protocol version `2025-11-25`, accepting servers that negotiate `2025-06-18`, `2025-03-26`, or `2024-11-05`
-- initialization and `notifications/initialized`
-- ping
+- MCP protocol `2026-07-28`: `server/discover` and per-request version and capabilities
 - paginated `tools/list`
 - `tools/call`, including structured content
 - progress notifications and timeout renewal
 - request cancellation
-- Streamable HTTP sessions, the server-to-client GET stream with reconnection, and resumption of dropped response streams with `Last-Event-ID`
+- stateless Streamable HTTP with JSON and request-scoped SSE responses
 - stdio shutdown per the spec (close stdin, then SIGTERM, then SIGKILL), applied to the server's whole process group
 - stdio over a caller-provided pipe (`PipeTransport`)
-- server `ping` and `roots/list` requests
-- logging and tool-list-change notifications through the generic notification API
+- per-request logging and tool-list updates via `subscriptions/listen`
 - OAuth protected-resource and authorization-server discovery
 - PKCE authorization code flow, dynamic client registration, token refresh (one refresh shared by concurrent 401s), and step-up authorization for `insufficient_scope`
 
-To use the [2026-07-28 Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks), pass `protocolVersion: TASKS_PROTOCOL_VERSION` to `McpClient`. This uses `server/discover` rather than the legacy handshake; the server must support that version. `callTool()` returns the final result in both modes. If the server returns a task handle, the client polls `tasks/get` at the server's suggested interval, reports status with `onProgress`, and sends `tasks/cancel` when the call is aborted. `timeoutMs` is per protocol request, not an overall task deadline.
+The [MCP Tasks extension](https://tasks.extensions.modelcontextprotocol.io/specification/2026-07-28/tasks) is enabled automatically when a server advertises it. If a server returns a task handle, `callTool()` polls `tasks/get` at the server's suggested interval, reports status with `onProgress`, and sends `tasks/cancel` when the call is aborted. It returns the final tool result whether the server runs the tool as a task or returns an immediate result. `timeoutMs` is per protocol request, not an overall task deadline.
 
 If a task requests input, `callTool()` uses the declared client capabilities and registered request handlers, deduplicating inputs before sending `tasks/update`. Use `request("tools/call", ...)` and `request("tasks/get", ...)` if you need to manage task handles yourself. Stateless discovery may omit `serverInfo`. This implements the Tasks workflow, not all features of the 2026-07-28 core revision.
 

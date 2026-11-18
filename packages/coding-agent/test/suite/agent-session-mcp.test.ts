@@ -1,8 +1,8 @@
 import { readFileSync, rmSync } from "node:fs";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { SystemMessage, ToolResultMessage } from "@earendil-works/pi-ai/compat";
-import { createMcpToolName, type JsonRpcRequest, LATEST_PROTOCOL_VERSION } from "@earendil-works/pi-mcp";
-import { createInMemoryTransportPair } from "@earendil-works/pi-mcp/testing";
+import { createMcpToolName, type JsonRpcId, type JsonRpcRequest, TASKS_PROTOCOL_VERSION } from "@earendil-works/pi-mcp";
+import { createInMemoryTransportPair, type InMemoryTransport } from "@earendil-works/pi-mcp/testing";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/types.ts";
@@ -45,9 +45,15 @@ const SERVER_TOOLS = [
 	{ name: "shot", description: "Returns an image.", inputSchema: { type: "object", properties: {} } },
 ];
 
+interface FakeServer {
+	client: InMemoryTransport;
+	server: InMemoryTransport;
+	readonly subscriptionId: JsonRpcId | undefined;
+}
+
 /**
  * Minimal MCP server over an in-memory transport. Records the tool calls it receives.
- * `initializeDelayMs` delays the answer to `initialize`; `Infinity` never answers.
+ * `discoverDelayMs` delays the answer to `server/discover`; `Infinity` never answers.
  */
 function createFakeServer(
 	calls: string[],
@@ -55,24 +61,37 @@ function createFakeServer(
 		listTools?: () => unknown[];
 		resources?: boolean;
 		instructions?: string;
-		initializeDelayMs?: number;
+		discoverDelayMs?: number;
+		watchTools?: boolean;
 	} = {},
-) {
-	const { listTools = () => SERVER_TOOLS, resources = false, instructions, initializeDelayMs = 0 } = options;
+): FakeServer {
+	const {
+		listTools = () => SERVER_TOOLS,
+		resources = false,
+		instructions,
+		discoverDelayMs = 0,
+		watchTools = false,
+	} = options;
 	const pair = createInMemoryTransportPair();
+	let subscriptionId: JsonRpcId | undefined;
 	const respond = (request: JsonRpcRequest): unknown => {
 		switch (request.method) {
-			case "initialize":
+			case "server/discover":
 				return {
-					protocolVersion: LATEST_PROTOCOL_VERSION,
-					capabilities: { tools: {}, ...(resources ? { resources: {} } : {}) },
-					serverInfo: { name: "docs", version: "1.0.0" },
+					resultType: "complete",
+					supportedVersions: [TASKS_PROTOCOL_VERSION],
+					capabilities: {
+						tools: watchTools ? { listChanged: true } : {},
+						...(resources ? { resources: {} } : {}),
+					},
+					_meta: { "io.modelcontextprotocol/serverInfo": { name: "docs", version: "1.0.0" } },
 					...(instructions ? { instructions } : {}),
 				};
 			case "tools/list":
-				return { tools: listTools() };
+				return { resultType: "complete", tools: listTools() };
 			case "resources/list":
 				return {
+					resultType: "complete",
 					resources: [
 						{ uri: "docs://intro", name: "intro", mimeType: "text/markdown", _meta: { x: 1 } },
 						// MCP App user interfaces are left out.
@@ -81,6 +100,7 @@ function createFakeServer(
 				};
 			case "resources/templates/list":
 				return {
+					resultType: "complete",
 					resourceTemplates: [
 						{ uriTemplate: "docs://pages/{slug}", name: "page", icons: [{ src: "data:image/png;base64,AAAA" }] },
 					],
@@ -88,19 +108,26 @@ function createFakeServer(
 			case "resources/read": {
 				const { uri } = request.params as { uri: string };
 				calls.push(`read:${uri}`);
-				return { contents: [{ uri, mimeType: "text/markdown", text: `# ${uri}` }] };
+				return { resultType: "complete", contents: [{ uri, mimeType: "text/markdown", text: `# ${uri}` }] };
 			}
 			case "tools/call": {
 				const params = request.params as { name: string; arguments?: { query?: string } };
 				calls.push(`${params.name}:${JSON.stringify(params.arguments ?? {})}`);
 				if (params.name === "search") {
 					const hits = [`${params.arguments?.query} guide`, `${params.arguments?.query} faq`];
-					return { content: [{ type: "text", text: hits.join("\n") }], structuredContent: { hits } };
+					return {
+						resultType: "complete",
+						content: [{ type: "text", text: hits.join("\n") }],
+						structuredContent: { hits },
+					};
 				}
 				if (params.name === "shot") {
-					return { content: [{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }] };
+					return {
+						resultType: "complete",
+						content: [{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }],
+					};
 				}
-				return { content: [{ type: "text", text: "server exploded" }], isError: true };
+				return { resultType: "complete", content: [{ type: "text", text: "server exploded" }], isError: true };
 			}
 			default:
 				return {};
@@ -109,11 +136,32 @@ function createFakeServer(
 	pair.server.onMessage((message) => {
 		if (!("id" in message) || !("method" in message)) return;
 		const request = message as JsonRpcRequest;
+		const params = request.params as { notifications?: { toolsListChanged?: boolean } } | undefined;
+		if (request.method === "subscriptions/listen" && watchTools && params?.notifications?.toolsListChanged) {
+			void pair.server
+				.send({
+					jsonrpc: "2.0",
+					method: "notifications/subscriptions/acknowledged",
+					params: {
+						_meta: { "io.modelcontextprotocol/subscriptionId": request.id },
+						notifications: { toolsListChanged: true },
+					},
+				})
+				.then(() => {
+					subscriptionId = request.id;
+				});
+			return;
+		}
 		const send = () => void pair.server.send({ jsonrpc: "2.0", id: request.id, result: respond(request) });
-		if (request.method !== "initialize" || initializeDelayMs === 0) queueMicrotask(send);
-		else if (Number.isFinite(initializeDelayMs)) setTimeout(send, initializeDelayMs);
+		if (request.method !== "server/discover" || discoverDelayMs === 0) queueMicrotask(send);
+		else if (Number.isFinite(discoverDelayMs)) setTimeout(send, discoverDelayMs);
 	});
-	return pair;
+	return {
+		...pair,
+		get subscriptionId() {
+			return subscriptionId;
+		},
+	};
 }
 
 describe("AgentSession MCP integration", () => {
@@ -142,6 +190,7 @@ describe("AgentSession MCP integration", () => {
 			withoutToolSearch?: boolean;
 			description?: string;
 			instructions?: string;
+			watchTools?: boolean;
 		} = {},
 	) {
 		const {
@@ -156,11 +205,12 @@ describe("AgentSession MCP integration", () => {
 			withoutToolSearch,
 			description,
 			instructions,
+			watchTools,
 			...configOptions
 		} = options;
 		const calls: string[] = [];
 		const notifications: string[] = [];
-		const servers: ReturnType<typeof createFakeServer>["server"][] = [];
+		const servers: FakeServer[] = [];
 		const entry: McpServerEntry = {
 			name: "docs",
 			config: {
@@ -185,8 +235,8 @@ describe("AgentSession MCP integration", () => {
 				createMcpExtension({
 					loadConfig: () => ({ servers: [entry], errors: [], ...configOptions }),
 					createTransport: () => {
-						const pair = createFakeServer(calls, { listTools, resources, instructions });
-						servers.push(pair.server);
+						const pair = createFakeServer(calls, { listTools, resources, instructions, watchTools });
+						servers.push(pair);
 						void pair.server.start();
 						return pair.client;
 					},
@@ -463,28 +513,33 @@ describe("AgentSession MCP integration", () => {
 		"withdraws and restores %s MCP tools the server changes",
 		async (exposure) => {
 			let tools = SERVER_TOOLS;
-			const { harness, servers } = await setup(exposure, () => tools);
+			const { harness, servers } = await setup(exposure, () => tools, { watchTools: true });
 			harness.setResponses([fauxAssistantMessage("ready")]);
 			await harness.session.prompt("start");
 			// Direct tools are declared to the model, codemode tools are only callable from codemode.
 			const reachable = () =>
 				exposure === "direct" ? harness.session.getActiveToolNames() : nestedToolNames(harness);
+			const server = servers[0];
+			await vi.waitFor(() => expect(server.subscriptionId).toBeDefined());
 			const listChanged = async () => {
-				await servers[0].send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
-				await new Promise((resolve) => setTimeout(resolve, 10));
+				await server.server.send({
+					jsonrpc: "2.0",
+					method: "notifications/tools/list_changed",
+					params: { _meta: { "io.modelcontextprotocol/subscriptionId": server.subscriptionId } },
+				});
 			};
 			expect(reachable()).toContain("mcp__docs__fail");
 
 			tools = SERVER_TOOLS.filter((tool) => tool.name !== "fail");
 			await listChanged();
-			expect(reachable()).not.toContain("mcp__docs__fail");
+			await vi.waitFor(() => expect(reachable()).not.toContain("mcp__docs__fail"));
 			expect(reachable()).toContain("mcp__docs__search");
 			const codemode = harness.session.agent.state.tools.find((tool) => tool.name === "codemode");
 			expect(codemode?.description ?? "").not.toContain("mcp__docs__fail");
 
 			tools = SERVER_TOOLS;
 			await listChanged();
-			expect(reachable()).toContain("mcp__docs__fail");
+			await vi.waitFor(() => expect(reachable()).toContain("mcp__docs__fail"));
 		},
 	);
 
@@ -727,7 +782,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 		expect(harness.session.getActiveToolNames()).toEqual([]);
 	});
 
-	/** A server named `slow` whose answer to `initialize` takes `initializeDelayMs`, without waiting for it. */
+	/** A server named `slow` whose answer to `server/discover` takes `discoverDelayMs`, without waiting for it. */
 	async function setupSlow(
 		config: {
 			exposure?: McpExposure;
@@ -735,7 +790,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 			name?: string;
 			instructions?: string;
 		},
-		initializeDelayMs: number,
+		discoverDelayMs: number,
 		startupWaitMs?: number,
 	) {
 		const calls: string[] = [];
@@ -750,7 +805,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 				createMcpExtension({
 					loadConfig: () => ({ servers: [entry], errors: [] }),
 					createTransport: () => {
-						const pair = createFakeServer(calls, { initializeDelayMs, instructions });
+						const pair = createFakeServer(calls, { discoverDelayMs, instructions });
 						void pair.server.start();
 						return pair.client;
 					},
@@ -766,7 +821,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 	}
 
 	it("does not hold the first prompt for codemode servers that are still connecting", async () => {
-		// The server never answers `initialize`.
+		// The server never answers `server/discover`.
 		const { harness } = await setupSlow({}, Number.POSITIVE_INFINITY);
 		harness.setResponses([fauxAssistantMessage("ready")]);
 
@@ -1152,13 +1207,13 @@ describe("AgentSession MCP tools after resume and reload", () => {
 	});
 
 	/**
-	 * A deferred `docs` server that answers `initialize` after `initializeDelayMs`; `connected` counts
+	 * A deferred `docs` server that answers `server/discover` after `discoverDelayMs`; `connected` counts
 	 * its connections. `/reload` loads the extensions again.
 	 */
 	async function setup(
 		sessionManager?: SessionManager,
 		extensionFactories: ExtensionFactory[] = [],
-		initializeDelayMs = 0,
+		discoverDelayMs = 0,
 	) {
 		const connected: string[] = [];
 		const servers: McpServerEntry[] = [
@@ -1171,7 +1226,7 @@ describe("AgentSession MCP tools after resume and reload", () => {
 				loadConfig: () => ({ servers, errors: [] }),
 				createTransport: (entry) => {
 					connected.push(entry.name);
-					const pair = createFakeServer([], { initializeDelayMs });
+					const pair = createFakeServer([], { discoverDelayMs });
 					void pair.server.start();
 					return pair.client;
 				},

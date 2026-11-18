@@ -10,7 +10,7 @@ CI runs it in the `mcp-conformance` job of `.github/workflows/ci.yml`. Requires 
 
 ## How it works
 
-For every protocol version pi negotiates (`2025-03-26`, `2025-06-18`, `2025-11-25`), `run.ts` lists the suite's client scenarios and runs them one at a time. The suite starts a scenario server and runs `client.ts` against it.
+`run.ts` runs selected MCP 2026-07-28 client scenarios one at a time. The suite starts a stateless scenario server and runs `client.ts` against it. The selection covers per-request metadata, standard HTTP headers for tools and resources, tool calls, JSON Schema preservation, and the OAuth flows pi exercises. It does not include scenarios for unimplemented features such as elicitation, custom tool headers, or network `$ref` resolution.
 
 `client.ts` uses the code pi runs for an HTTP server in `mcp.json`: `McpServerConnection` connects and calls tools, and `signInMcpServer` runs the OAuth sign-in that `/mcp` starts. A simulated browser fetches the authorization URL and delivers the redirect to pi's loopback callback server. When the server asks for sign-in again (for example for more scope), the simulated user signs in again, up to three times.
 
@@ -27,19 +27,18 @@ Checks that started passing are reported; update the baseline to lock them in.
 ## Options
 
 ```bash
-node packages/coding-agent/test/mcp-conformance/run.ts --mode 2025-11-25 --scenario auth/scope-step-up --verbose
+node packages/coding-agent/test/mcp-conformance/run.ts --scenario auth/scope-step-up --verbose
 node packages/coding-agent/test/mcp-conformance/run.ts --update-baseline
 ```
 
-- `--mode`, `--scenario`: run a subset (repeatable).
+- `--scenario`: run a subset of the selected scenarios (repeatable).
 - `--verbose`: print the suite's output, including each check and the client's log.
 - `--keep-results`: keep the suite's `checks.json` and client output.
 - `--update-baseline`: write the results of a full run to `baseline.json`. Review the diff; do not regenerate it to hide a regression.
 
 ## Known failures
 
-- `elicitation-sep1034-client-defaults`: pi does not support elicitation.
 - `auth/basic-cimd`: pi uses its Client ID Metadata Document on pi.dev, not the suite's `https://conformance-test.local/client-metadata.json`.
 - `auth/scope-retry-limit`: `pi-client` fails by design; the server never accepts the granted scope.
 
-2026-07-28 is not covered: it is a stateless protocol pi does not implement.
+The upstream `request-metadata` fixture rejects the first request even when it uses the only version the fixture advertises. It still checks that request's metadata and version header. pi does not retry discovery with the same version.

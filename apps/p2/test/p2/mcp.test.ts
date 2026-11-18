@@ -552,7 +552,7 @@ test("another incarnation of the same generation takes the lease; the first one'
 
 test("placement: environments not in envs.json fail; HTTP servers connect with host variables, per session when unshared, or ask to sign in", async (t) => {
 	const authorizations: (string | undefined)[] = [];
-	const sessions = new Set<string>();
+	const discoveries: (string | undefined)[] = [];
 	const http = createServer((request, response) => {
 		if (request.url === "/locked") return void response.writeHead(401).end();
 		if (request.method !== "POST") return void response.writeHead(405).end();
@@ -562,25 +562,20 @@ test("placement: environments not in envs.json fail; HTTP servers connect with h
 			body += chunk.toString();
 		});
 		request.on("end", () => {
-			const message = JSON.parse(body) as { id?: number; method: string };
-			if (message.id === undefined) return void response.writeHead(202).end();
+			const message = JSON.parse(body) as { id: number; method: string };
+			if (message.method === "server/discover") discoveries.push(request.url);
 			const result =
-				message.method === "initialize"
+				message.method === "server/discover"
 					? {
-							protocolVersion: "2025-06-18",
+							resultType: "complete",
+							supportedVersions: ["2026-07-28"],
 							capabilities: { tools: {} },
-							serverInfo: { name: "http-fixture", version: "1.0.0" },
+							_meta: { "io.modelcontextprotocol/serverInfo": { name: "http-fixture", version: "1.0.0" } },
 						}
 					: message.method === "tools/list"
-						? { tools: [{ name: "lookup", inputSchema: { type: "object" } }] }
-						: { content: [{ type: "text", text: "found" }] };
-			// Each `initialize` opens one MCP session: one per connection of the client.
-			const session = message.method === "initialize" ? `m${sessions.size}` : undefined;
-			if (session !== undefined) sessions.add(`${request.url}:${session}`);
-			response.writeHead(200, {
-				"content-type": "application/json",
-				...(session === undefined ? {} : { "mcp-session-id": session }),
-			});
+						? { resultType: "complete", tools: [{ name: "lookup", inputSchema: { type: "object" } }] }
+						: { resultType: "complete", content: [{ type: "text", text: "found" }] };
+			response.writeHead(200, { "content-type": "application/json" });
 			response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
 		});
 	});
@@ -622,7 +617,7 @@ test("placement: environments not in envs.json fail; HTTP servers connect with h
 	);
 	// One shared docs connection for both sessions, one unshared one per session.
 	assert.equal(status(all, "docs").length, 1);
-	assert.equal([...sessions].filter((session) => session.startsWith("/mine:")).length, 2);
+	assert.deepEqual(discoveries.sort(), ["/mcp", "/mine", "/mine"]);
 	// Only s2's own stdio server runs on this machine; s1's are on environments.
 	await until(s2.servers, isUp("here"));
 	assert.equal(host.starts().length, 1);

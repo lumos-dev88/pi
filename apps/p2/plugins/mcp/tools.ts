@@ -56,8 +56,8 @@ export type McpReach = "codemode" | "tool_search";
 
 /**
  * One of the session's instances as the extension offers it: its ID and server, whether it signs in with OAuth (its
- * namespace says how the user signs in), its one-line summary (empty: none), its instructions from `initialize`, and its
- * tools. Its status is left out: a status change changes nothing the model sees.
+ * namespace says how the user signs in), its one-line summary (empty: none), its instructions from `server/discover`,
+ * and its tools. Its status is left out: a status change changes nothing the model sees.
  */
 export type OfferedInstance = {
 	readonly id: string;

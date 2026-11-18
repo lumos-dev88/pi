@@ -2,9 +2,10 @@
  * An Agent with the tools of an MCP server plus a codemode tool that calls them from JavaScript.
  *
  *   ANTHROPIC_API_KEY=... node packages/agent/examples/mcp-codemode/main.ts \
- *     npx -y @modelcontextprotocol/server-filesystem .
+ *     node packages/mcp/test/fixtures/stdio-server.mjs
  *
- * The arguments are the command that starts a stdio MCP server.
+ * The arguments are the command that starts an MCP 2026-07-28 stdio server.
+ * The command above runs the repository's local echo server.
  */
 
 import { Agent } from "@earendil-works/pi-agent-core";
@@ -43,7 +44,9 @@ try {
 			console.log(`\n[${event.toolName}]`);
 		}
 	});
-	await agent.prompt("Use codemode to list what the MCP tools can do, then summarize it in two sentences.");
+	await agent.prompt(
+		"If the MCP server offers an echo tool, use codemode to echo Hello from codemode. Otherwise summarize the available tools.",
+	);
 	console.log();
 } finally {
 	await client.close();

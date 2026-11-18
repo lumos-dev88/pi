@@ -2,13 +2,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type JsonRpcMessage,
 	type JsonRpcRequest,
-	LATEST_PROTOCOL_VERSION,
 	McpAbortError,
 	McpClient,
 	type McpClientOptions,
 	McpConnectionClosedError,
 	McpError,
 	McpTimeoutError,
+	type ServerCapabilities,
 	TASKS_PROTOCOL_VERSION,
 } from "../src/index.ts";
 import { createInMemoryTransportPair, type InMemoryTransport } from "../src/testing/index.ts";
@@ -19,6 +19,7 @@ const metadata = {
 	"io.modelcontextprotocol/clientInfo": { name: "test-client", version: "2.0.0" },
 };
 const tasksCapabilities = { extensions: { [tasksExtension]: {} } };
+const serverInfo = { name: "test-server", version: "1.0.0" };
 
 interface TestServer {
 	transport: InMemoryTransport;
@@ -26,7 +27,9 @@ interface TestServer {
 	setHandler(method: string, handler: (request: JsonRpcRequest) => unknown | Promise<unknown>): void;
 }
 
-async function createServer(): Promise<{ clientTransport: InMemoryTransport; server: TestServer }> {
+async function createServer(
+	capabilities: ServerCapabilities = { tools: {}, ...tasksCapabilities },
+): Promise<{ clientTransport: InMemoryTransport; server: TestServer }> {
 	const pair = createInMemoryTransportPair();
 	const handlers = new Map<string, (request: JsonRpcRequest) => unknown | Promise<unknown>>();
 	const messages: JsonRpcMessage[] = [];
@@ -62,59 +65,27 @@ async function createServer(): Promise<{ clientTransport: InMemoryTransport; ser
 			handlers.set(method, handler);
 		},
 	};
-	server.setHandler("initialize", () => ({
-		protocolVersion: LATEST_PROTOCOL_VERSION,
-		capabilities: { tools: { listChanged: true } },
-		serverInfo: { name: "test-server", version: "1.0.0" },
+	server.setHandler("server/discover", () => ({
+		resultType: "complete",
+		supportedVersions: [TASKS_PROTOCOL_VERSION],
+		capabilities,
+		_meta: { "io.modelcontextprotocol/serverInfo": serverInfo },
 		instructions: "Use test tools.",
 	}));
 	return { clientTransport: pair.client, server };
 }
 
-async function connect(): Promise<{ client: McpClient; server: TestServer }> {
-	const { clientTransport, server } = await createServer();
-	const client = new McpClient({ name: "test-client", version: "2.0.0" });
-	await client.connect(clientTransport);
-	return { client, server };
-}
-
-async function connectModern(
-	options?: Partial<McpClientOptions>,
-	extensions: Record<string, unknown> = tasksCapabilities.extensions,
-) {
-	const { clientTransport, server } = await createServer();
-	server.setHandler("server/discover", () => ({
-		resultType: "complete",
-		supportedVersions: [TASKS_PROTOCOL_VERSION],
-		capabilities: { tools: {}, extensions },
-		_meta: { "io.modelcontextprotocol/serverInfo": { name: "modern-server", version: "1.0.0" } },
-	}));
-	const client = new McpClient({
-		name: "test-client",
-		version: "2.0.0",
-		protocolVersion: TASKS_PROTOCOL_VERSION,
-		...options,
-	});
+async function connect(options?: Partial<McpClientOptions>, capabilities?: ServerCapabilities) {
+	const { clientTransport, server } = await createServer(capabilities);
+	const client = new McpClient({ name: "test-client", version: "2.0.0", ...options });
 	await client.connect(clientTransport);
 	return { client, server };
 }
 
 describe("MCP Tasks", () => {
 	it("polls two task handles independently and preserves both final results and progress", async () => {
-		const { client, server } = await connectModern();
+		const { client, server } = await connect();
 		try {
-			expect(client.serverInfo?.name).toBe("modern-server");
-			expect(server.messages).toEqual([
-				{
-					jsonrpc: "2.0",
-					id: 1,
-					method: "server/discover",
-					params: {
-						_meta: { ...metadata, "io.modelcontextprotocol/clientCapabilities": { extensions: {} } },
-					},
-				},
-			]);
-
 			const started = new Set<string>();
 			server.setHandler("tools/call", ({ params }) => {
 				const { name, _meta } = params as { name: string; _meta: unknown };
@@ -165,7 +136,7 @@ describe("MCP Tasks", () => {
 	});
 
 	it("uses stateless requests without Tasks when the server does not advertise it", async () => {
-		const { client, server } = await connectModern({}, {});
+		const { client, server } = await connect(undefined, { tools: {} });
 		try {
 			server.setHandler("tools/call", ({ params }) => {
 				expect(params).toMatchObject({
@@ -181,10 +152,12 @@ describe("MCP Tasks", () => {
 		}
 	});
 
-	it("delivers each task input request once and retrieves the result", async () => {
+	it("answers roots through task input exactly once, not a standalone request", async () => {
 		const root = { uri: "file:///workspace", name: "workspace" };
-		const { client, server } = await connectModern({ roots: [root] });
+		const { client, server } = await connect({ roots: [root] });
 		try {
+			const standaloneId = "standalone-roots";
+			await server.transport.send({ jsonrpc: "2.0", id: standaloneId, method: "roots/list" });
 			server.setHandler("tools/call", () => ({
 				resultType: "task",
 				taskId: "needs-roots",
@@ -205,13 +178,14 @@ describe("MCP Tasks", () => {
 			server.setHandler("tasks/update", updates);
 			expect(await client.callTool("roots")).toEqual({ content: [{ type: "text", text: "used the root" }] });
 			expect(updates).toHaveBeenCalledTimes(1);
+			expect(server.messages.some((message) => "id" in message && message.id === standaloneId)).toBe(false);
 		} finally {
 			await client.close();
 		}
 	});
 
 	it("cancels the task by ID when aborted during the delay between polls", async () => {
-		const { client, server } = await connectModern();
+		const { client, server } = await connect();
 		try {
 			server.setHandler("tools/call", () => ({
 				resultType: "task",
@@ -242,7 +216,7 @@ describe("MCP Tasks", () => {
 	});
 
 	it("cancels a handle that arrives after its originating request was aborted", async () => {
-		const { client, server } = await connectModern();
+		const { client, server } = await connect();
 		try {
 			const started = Promise.withResolvers<void>();
 			const handle = Promise.withResolvers<unknown>();
@@ -268,7 +242,7 @@ describe("MCP Tasks", () => {
 	});
 
 	it("surfaces task errors and rejects when a connection closes while waiting to poll", async () => {
-		const { client, server } = await connectModern();
+		const { client, server } = await connect();
 		try {
 			server.setHandler("tools/call", () => ({ resultType: "task", taskId: "fail", status: "failed" }));
 			server.setHandler("tasks/get", () => ({
@@ -305,25 +279,22 @@ afterEach(() => {
 });
 
 describe("McpClient", () => {
-	it("initializes the connection before exposing server information", async () => {
+	it("discovers the only supported protocol before exposing server information", async () => {
 		const { client, server } = await connect();
 		expect(client.connectionState).toBe("connected");
-		expect(client.protocolVersion).toBe(LATEST_PROTOCOL_VERSION);
-		expect(client.serverInfo).toEqual({ name: "test-server", version: "1.0.0" });
-		expect(client.serverCapabilities).toEqual({ tools: { listChanged: true } });
+		expect(client.protocolVersion).toBe(TASKS_PROTOCOL_VERSION);
+		expect(client.serverInfo).toEqual(serverInfo);
+		expect(client.serverCapabilities).toEqual({ tools: {}, ...tasksCapabilities });
 		expect(client.instructions).toBe("Use test tools.");
 		expect(server.messages).toEqual([
 			{
 				jsonrpc: "2.0",
 				id: 1,
-				method: "initialize",
+				method: "server/discover",
 				params: {
-					protocolVersion: LATEST_PROTOCOL_VERSION,
-					capabilities: {},
-					clientInfo: { name: "test-client", version: "2.0.0" },
+					_meta: { ...metadata, "io.modelcontextprotocol/clientCapabilities": { extensions: {} } },
 				},
 			},
-			{ jsonrpc: "2.0", method: "notifications/initialized" },
 		]);
 		await client.close();
 	});
@@ -402,11 +373,13 @@ describe("McpClient", () => {
 			const params = request.params as { name: string; arguments?: Record<string, unknown> };
 			if (params.name === "fail") throw new McpError(1234, "tool failed", { retryable: false });
 			return {
+				resultType: "complete",
 				content: [{ type: "text", text: "ok" }],
 				structuredContent: { count: params.arguments?.count },
 			};
 		});
 		expect(await client.callTool("count", { count: 3 })).toEqual({
+			resultType: "complete",
 			content: [{ type: "text", text: "ok" }],
 			structuredContent: { count: 3 },
 		});
@@ -433,19 +406,19 @@ describe("McpClient", () => {
 				});
 			}, 40);
 			await new Promise((resolve) => setTimeout(resolve, 80));
-			return { content: [{ type: "text", text: "done" }] };
+			return { resultType: "complete", content: [{ type: "text", text: "done" }] };
 		});
 		const progress = vi.fn();
 		const result = client.callTool("slow", {}, { timeoutMs: 50, onProgress: progress });
 		await vi.advanceTimersByTimeAsync(40);
 		await vi.advanceTimersByTimeAsync(40);
-		expect(await result).toEqual({ content: [{ type: "text", text: "done" }] });
+		expect(await result).toEqual({ resultType: "complete", content: [{ type: "text", text: "done" }] });
 		expect(progress).toHaveBeenCalledWith({ progressToken: 2, progress: 1, total: 2 });
 		await client.close();
 	});
 
 	it("cancels aborted and timed-out requests", async () => {
-		const { client, server } = await connect();
+		const { client, server } = await connect(undefined, { tools: {} });
 		server.setHandler("tools/call", () => new Promise(() => {}));
 		const controller = new AbortController();
 		const aborted = client.callTool("wait", {}, { signal: controller.signal });
@@ -473,46 +446,51 @@ describe("McpClient", () => {
 			"tools/call",
 			() =>
 				new Promise((resolve) => {
-					respond = () => resolve({ content: [] });
+					respond = () => resolve({ resultType: "complete", content: [] });
 				}),
 		);
 		const call = client.callTool("wait");
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		clientTransport.emitError(new Error("stray log line"));
 		respond();
-		expect(await call).toEqual({ content: [] });
+		expect(await call).toEqual({ resultType: "complete", content: [] });
 		expect(errors.map((error) => error.message)).toEqual(["stray log line"]);
 		await client.close();
 	});
 
-	it("accepts servers that answer with an older protocol version", async () => {
+	it.each([
+		{
+			reason: "discover not implemented",
+			discover: () => {
+				throw new McpError(-32601, "Method not found");
+			},
+			error: "Method not found",
+		},
+		{
+			reason: "older protocol only",
+			discover: () => ({ resultType: "complete", supportedVersions: ["2025-06-18"], capabilities: {} }),
+			error: TASKS_PROTOCOL_VERSION,
+		},
+	])("does not fall back when discovery reports $reason", async ({ discover, error }) => {
 		const { clientTransport, server } = await createServer();
-		server.setHandler("initialize", () => ({
-			protocolVersion: "2024-11-05",
-			capabilities: {},
-			serverInfo: { name: "old-server", version: "0.1.0" },
-		}));
+		server.setHandler("server/discover", discover);
 		const client = new McpClient({ name: "test-client", version: "1.0.0" });
-		await client.connect(clientTransport);
-		expect(client.protocolVersion).toBe("2024-11-05");
-		await client.close();
-
-		const unsupported = await createServer();
-		unsupported.server.setHandler("initialize", () => ({
-			protocolVersion: "1999-01-01",
-			capabilities: {},
-			serverInfo: { name: "ancient-server", version: "0.1.0" },
-		}));
-		const rejected = new McpClient({ name: "test-client", version: "1.0.0" });
-		await expect(rejected.connect(unsupported.clientTransport)).rejects.toThrow("unsupported protocol version");
-		expect(rejected.connectionState).toBe("closed");
+		await expect(client.connect(clientTransport)).rejects.toThrow(error);
+		expect(client.connectionState).toBe("closed");
+		expect(server.messages.map((message) => ("method" in message ? message.method : undefined))).toEqual([
+			"server/discover",
+		]);
 	});
 
 	it("defaults missing tool result content to an empty list", async () => {
 		const { client, server } = await connect();
-		server.setHandler("tools/call", () => ({ structuredContent: { ok: true } }));
-		expect(await client.callTool("structured")).toEqual({ content: [], structuredContent: { ok: true } });
-		server.setHandler("tools/call", () => ({ content: "not a list" }));
+		server.setHandler("tools/call", () => ({ resultType: "complete", structuredContent: { ok: true } }));
+		expect(await client.callTool("structured")).toEqual({
+			resultType: "complete",
+			content: [],
+			structuredContent: { ok: true },
+		});
+		server.setHandler("tools/call", () => ({ resultType: "complete", content: "not a list" }));
 		await expect(client.callTool("broken")).rejects.toThrow("Invalid MCP tools/call result");
 		await client.close();
 	});
@@ -521,21 +499,22 @@ describe("McpClient", () => {
 	it("accepts structured content that is not an object", async () => {
 		const { client, server } = await connect();
 		for (const structuredContent of [[{ id: 1 }, { id: 2 }], null, "text", 3, false]) {
-			server.setHandler("tools/call", () => ({ content: [], structuredContent }));
-			expect(await client.callTool("structured")).toEqual({ content: [], structuredContent });
+			server.setHandler("tools/call", () => ({ resultType: "complete", content: [], structuredContent }));
+			expect(await client.callTool("structured")).toEqual({
+				resultType: "complete",
+				content: [],
+				structuredContent,
+			});
 		}
 		await client.close();
 	});
 
-	it("does not send notifications/cancelled for a timed-out initialize", async () => {
+	it("closes the connection when discovery times out", async () => {
 		const { clientTransport, server } = await createServer();
-		server.setHandler("initialize", () => new Promise(() => {}));
+		server.setHandler("server/discover", () => new Promise(() => {}));
 		const client = new McpClient({ name: "test-client", version: "1.0.0", requestTimeoutMs: 5 });
 		await expect(client.connect(clientTransport)).rejects.toBeInstanceOf(McpTimeoutError);
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(
-			server.messages.some((message) => "method" in message && message.method === "notifications/cancelled"),
-		).toBe(false);
+		expect(client.connectionState).toBe("closed");
 	});
 
 	it("notifies close listeners once when the transport drops", async () => {
@@ -552,25 +531,67 @@ describe("McpClient", () => {
 		expect(closed).toHaveBeenCalledTimes(1);
 	});
 
-	it("answers roots/list and dispatches notifications", async () => {
-		const { clientTransport, server } = await createServer();
-		const client = new McpClient({
-			name: "test-client",
-			version: "1.0.0",
-			roots: [{ uri: "file:///workspace", name: "workspace" }],
+	it("only delivers tool list changes for an acknowledged subscription", async () => {
+		const { clientTransport, server } = await createServer({ tools: { listChanged: true } });
+		const request = Promise.withResolvers<JsonRpcRequest>();
+		server.setHandler("subscriptions/listen", (message) => {
+			request.resolve(message);
+			return new Promise(() => {});
 		});
-		await client.connect(clientTransport);
+		const client = new McpClient({ name: "test-client", version: "2.0.0" });
 		const changed = vi.fn();
+		const alsoChanged = vi.fn();
 		client.onNotification("notifications/tools/list_changed", changed);
-		await server.transport.send({ jsonrpc: "2.0", id: "roots", method: "roots/list" });
-		await server.transport.send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(server.messages).toContainEqual({
-			jsonrpc: "2.0",
-			id: "roots",
-			result: { roots: [{ uri: "file:///workspace", name: "workspace" }] },
-		});
-		expect(changed).toHaveBeenCalledWith(undefined);
-		await client.close();
+		await client.connect(clientTransport);
+		client.onNotification("notifications/tools/list_changed", alsoChanged);
+		try {
+			const { id, params } = await request.promise;
+			expect(params).toEqual({
+				notifications: { toolsListChanged: true },
+				_meta: { ...metadata, "io.modelcontextprotocol/clientCapabilities": { extensions: {} } },
+			});
+			const sendChange = (subscriptionId: JsonRpcRequest["id"]) =>
+				server.transport.send({
+					jsonrpc: "2.0",
+					method: "notifications/tools/list_changed",
+					params: { _meta: { "io.modelcontextprotocol/subscriptionId": subscriptionId } },
+				});
+			await sendChange(id);
+			await server.transport.send({
+				jsonrpc: "2.0",
+				method: "notifications/subscriptions/acknowledged",
+				params: {
+					_meta: { "io.modelcontextprotocol/subscriptionId": id },
+					notifications: { toolsListChanged: true },
+				},
+			});
+			await server.transport.send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+			await sendChange("wrong-subscription");
+			await sendChange(id);
+			const delivered = { _meta: { "io.modelcontextprotocol/subscriptionId": id } };
+			expect(changed.mock.calls).toEqual([[delivered]]);
+			expect(alsoChanged.mock.calls).toEqual([[delivered]]);
+			expect(server.messages.map((message) => ("method" in message ? message.method : undefined))).toEqual([
+				"server/discover",
+				"subscriptions/listen",
+			]);
+		} finally {
+			await client.close();
+		}
+	});
+
+	it("does not subscribe when the server does not advertise tool list changes", async () => {
+		const { client, server } = await connect();
+		try {
+			const changed = vi.fn();
+			client.onNotification("notifications/tools/list_changed", changed);
+			await server.transport.send({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+			expect(changed).not.toHaveBeenCalled();
+			expect(server.messages.map((message) => ("method" in message ? message.method : undefined))).toEqual([
+				"server/discover",
+			]);
+		} finally {
+			await client.close();
+		}
 	});
 });

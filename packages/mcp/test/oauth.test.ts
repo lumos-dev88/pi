@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { createConnection } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { McpClient, StreamableHttpTransport } from "../src/index.ts";
+import { McpClient, StreamableHttpTransport, TASKS_PROTOCOL_VERSION } from "../src/index.ts";
 import {
 	adaptOAuthProvider,
 	authorizeMcp,
@@ -98,9 +98,12 @@ describe("MCP OAuth", () => {
 	it("discovers, registers, authorizes with PKCE, and refreshes on 401", async () => {
 		let expectedChallenge: string | undefined;
 		let refreshes = 0;
+		const mcpRequests: unknown[][] = [];
+		const discoveryVersions: (string | string[] | undefined)[] = [];
 		const origin = await listen(async (request, response, serverOrigin) => {
 			const url = new URL(request.url ?? "/", serverOrigin);
 			if (url.pathname === "/.well-known/oauth-protected-resource/mcp") {
+				discoveryVersions.push(request.headers["mcp-protocol-version"]);
 				response.setHeader("content-type", "application/json");
 				response.end(
 					JSON.stringify({
@@ -181,19 +184,15 @@ describe("MCP OAuth", () => {
 				response.end();
 				return;
 			}
-			if (request.method === "GET") {
-				response.statusCode = 405;
-				response.end();
-				return;
-			}
-			if (request.method === "DELETE") {
-				response.statusCode = 200;
-				response.end();
-				return;
-			}
+			const message = JSON.parse(await readBody(request)) as Record<string, unknown>;
+			mcpRequests.push([
+				request.method,
+				request.headers["mcp-protocol-version"],
+				request.headers["mcp-method"],
+				message.method,
+			]);
 			const token = request.headers.authorization;
 			if (token !== "Bearer first-token" && token !== "Bearer refreshed-token") {
-				await readBody(request);
 				response.writeHead(401, {
 					// An empty scope falls through to the resource metadata's scopes_supported.
 					"www-authenticate": `Bearer resource_metadata="${serverOrigin}/.well-known/oauth-protected-resource/mcp", scope=""`,
@@ -201,18 +200,17 @@ describe("MCP OAuth", () => {
 				response.end("Unauthorized");
 				return;
 			}
-			const message = JSON.parse(await readBody(request)) as Record<string, unknown>;
-			if (!("id" in message)) {
-				response.statusCode = 202;
-				response.end();
+			if (message.method !== "server/discover" && message.method !== "tools/list") {
+				response.writeHead(400).end();
 				return;
 			}
 			const result =
-				message.method === "initialize"
+				message.method === "server/discover"
 					? {
-							protocolVersion: "2025-06-18",
+							resultType: "complete",
+							supportedVersions: [TASKS_PROTOCOL_VERSION],
 							capabilities: { tools: {} },
-							serverInfo: { name: "oauth-test", version: "1.0.0" },
+							_meta: { "io.modelcontextprotocol/serverInfo": { name: "oauth-test", version: "1.0.0" } },
 						}
 					: { tools: [{ name: "issues", inputSchema: { type: "object" } }] };
 			response.setHeader("content-type", "application/json");
@@ -228,7 +226,6 @@ describe("MCP OAuth", () => {
 					url: `${origin}/mcp`,
 					headers: { Authorization: "Bearer caller-supplied-stale-token" },
 					authProvider: adaptOAuthProvider(provider),
-					openGetStream: false,
 				}),
 			),
 		).rejects.toBeInstanceOf(McpOAuthAuthorizationRequiredError);
@@ -253,7 +250,6 @@ describe("MCP OAuth", () => {
 				url: `${origin}/mcp`,
 				headers: { Authorization: "Bearer caller-supplied-stale-token" },
 				authProvider: adaptOAuthProvider(provider),
-				openGetStream: false,
 			}),
 		);
 		expect(await client.listTools()).toEqual([{ name: "issues", inputSchema: { type: "object" } }]);
@@ -266,7 +262,6 @@ describe("MCP OAuth", () => {
 				url: `${origin}/mcp`,
 				headers: { Authorization: "Bearer caller-supplied-stale-token" },
 				authProvider: adaptOAuthProvider(provider),
-				openGetStream: false,
 			}),
 		);
 		// Neither token response names a scope, so the grant has the requested scope.
@@ -278,6 +273,16 @@ describe("MCP OAuth", () => {
 		});
 		expect(refreshes).toBe(1);
 		await refreshedClient.close();
+		expect(mcpRequests).toEqual(
+			["server/discover", "server/discover", "tools/list", "server/discover", "server/discover"].map((method) => [
+				"POST",
+				TASKS_PROTOCOL_VERSION,
+				method,
+				method,
+			]),
+		);
+		expect(discoveryVersions.length).toBeGreaterThan(0);
+		expect(new Set(discoveryVersions)).toEqual(new Set([TASKS_PROTOCOL_VERSION]));
 		await callback.close();
 	});
 

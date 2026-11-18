@@ -23,8 +23,28 @@ import { parseArgs } from "node:util";
 
 /** The pinned upstream suite. Bumping it requires reviewing and regenerating the baseline. */
 const CONFORMANCE_PACKAGE = "@modelcontextprotocol/conformance@0.2.0-alpha.11";
-/** Protocol versions pi negotiates. 2026-07-28 is a different (stateless) protocol pi does not speak. */
-const MODES = ["2025-03-26", "2025-06-18", "2025-11-25"] as const;
+const PROTOCOL_VERSION = "2026-07-28";
+// Cover the parts of the upstream suite exercised by pi's MCP and OAuth client.
+const SCENARIOS: readonly string[] = [
+	"tools_call",
+	"request-metadata",
+	"http-standard-headers",
+	"json-schema-2020-12-preservation",
+	"auth/metadata-default",
+	"auth/metadata-var1",
+	"auth/metadata-var2",
+	"auth/metadata-var3",
+	"auth/basic-cimd",
+	"auth/scope-from-www-authenticate",
+	"auth/scope-from-scopes-supported",
+	"auth/scope-omitted-when-undefined",
+	"auth/scope-step-up",
+	"auth/scope-retry-limit",
+	"auth/token-endpoint-auth-basic",
+	"auth/token-endpoint-auth-post",
+	"auth/token-endpoint-auth-none",
+	"auth/pre-registration",
+];
 const SCENARIO_TIMEOUT_MS = 30_000;
 /** Checks that are part of the suite's HTTP trace, not assertions. */
 const IGNORED_STATUSES = new Set(["INFO", "SKIPPED"]);
@@ -37,7 +57,6 @@ const resolverUrl = pathToFileURL(join(here, "../../src/experimental/source-reso
 type CheckStatus = "pass" | "fail";
 
 interface ScenarioResult {
-	mode: string;
 	scenario: string;
 	/** Check id to status. Repeated ids pass only when every instance passes. */
 	checks: Map<string, CheckStatus>;
@@ -52,7 +71,8 @@ interface BaselineScenario {
 
 interface Baseline {
 	conformance: string;
-	modes: Record<string, Record<string, BaselineScenario>>;
+	protocolVersion: string;
+	scenarios: Record<string, BaselineScenario>;
 }
 
 interface RawCheck {
@@ -102,15 +122,6 @@ function conformanceEnv(): NodeJS.ProcessEnv {
 	return { ...process.env, npm_config_ignore_scripts: "true", npm_config_yes: "true" };
 }
 
-async function listScenarios(mode: string, workDir: string): Promise<string[]> {
-	const result = await runCommand("npx", ["--yes", CONFORMANCE_PACKAGE, "list", "--client", "--spec-version", mode], {
-		cwd: workDir,
-		env: conformanceEnv(),
-	});
-	if (result.code !== 0) throw new Error(`Listing ${mode} scenarios failed:\n${result.stderr || result.stdout}`);
-	return [...result.stdout.matchAll(/^\s+- (\S+)/gm)].map((match) => match[1]);
-}
-
 function findFile(dir: string, name: string): string | undefined {
 	if (!existsSync(dir)) return undefined;
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -130,16 +141,15 @@ function record(result: ScenarioResult, id: string, status: CheckStatus, message
 }
 
 async function runScenario(
-	mode: string,
 	scenario: string,
 	launcher: string,
 	workDir: string,
 	verbose: boolean,
 ): Promise<ScenarioResult> {
-	const scenarioDir = join(workDir, mode, scenario.replace(/[^A-Za-z0-9_.-]+/g, "-"));
+	const scenarioDir = join(workDir, scenario.replace(/[^A-Za-z0-9_.-]+/g, "-"));
 	mkdirSync(scenarioDir, { recursive: true });
 	const reportPath = join(scenarioDir, "pi-client.json");
-	const result: ScenarioResult = { mode, scenario, checks: new Map(), messages: new Map() };
+	const result: ScenarioResult = { scenario, checks: new Map(), messages: new Map() };
 	const run = await runCommand(
 		"npx",
 		[
@@ -151,7 +161,7 @@ async function runScenario(
 			"--scenario",
 			scenario,
 			"--spec-version",
-			mode,
+			PROTOCOL_VERSION,
 			"--timeout",
 			String(SCENARIO_TIMEOUT_MS),
 			"--output-dir",
@@ -192,11 +202,10 @@ function loadBaseline(): Baseline | undefined {
 }
 
 function toBaseline(results: ScenarioResult[]): Baseline {
-	const baseline: Baseline = { conformance: CONFORMANCE_PACKAGE, modes: {} };
+	const baseline: Baseline = { conformance: CONFORMANCE_PACKAGE, protocolVersion: PROTOCOL_VERSION, scenarios: {} };
 	for (const result of results) {
 		const ids = [...result.checks.keys()].sort();
-		baseline.modes[result.mode] ??= {};
-		baseline.modes[result.mode][result.scenario] = {
+		baseline.scenarios[result.scenario] = {
 			passing: ids.filter((id) => result.checks.get(id) === "pass"),
 			failing: ids.filter((id) => result.checks.get(id) === "fail"),
 		};
@@ -209,25 +218,21 @@ function evaluate(results: ScenarioResult[], baseline: Baseline): boolean {
 	const regressions: string[] = [];
 	const fixed: string[] = [];
 	for (const result of results) {
-		const expected = baseline.modes[result.mode]?.[result.scenario];
-		const label = `${result.mode} ${result.scenario}`;
+		const expected = baseline.scenarios[result.scenario];
 		for (const [id, status] of result.checks) {
 			const message = result.messages.get(id);
 			if (status === "fail" && !expected?.failing.includes(id)) {
-				regressions.push(`${label}: ${id} fails${message ? `: ${message}` : ""}`);
+				regressions.push(`${result.scenario}: ${id} fails${message ? `: ${message}` : ""}`);
 			}
-			if (status === "pass" && expected?.failing.includes(id)) fixed.push(`${label}: ${id}`);
+			if (status === "pass" && expected?.failing.includes(id)) fixed.push(`${result.scenario}: ${id}`);
 		}
 		for (const id of expected?.passing ?? []) {
-			if (!result.checks.has(id)) regressions.push(`${label}: ${id} was not reported`);
+			if (!result.checks.has(id)) regressions.push(`${result.scenario}: ${id} was not reported`);
 		}
 	}
-	for (const [mode, scenarios] of Object.entries(baseline.modes)) {
-		for (const scenario of Object.keys(scenarios)) {
-			if (!results.some((result) => result.mode === mode && result.scenario === scenario)) {
-				regressions.push(`${mode} ${scenario}: scenario did not run`);
-			}
-		}
+	for (const scenario of Object.keys(baseline.scenarios)) {
+		if (!results.some((result) => result.scenario === scenario))
+			regressions.push(`${scenario}: scenario did not run`);
 	}
 	if (fixed.length > 0) {
 		console.log(
@@ -243,20 +248,16 @@ function evaluate(results: ScenarioResult[], baseline: Baseline): boolean {
 }
 
 function printResults(results: ScenarioResult[]): void {
-	for (const mode of MODES) {
-		const modeResults = results.filter((result) => result.mode === mode);
-		if (modeResults.length === 0) continue;
-		console.log(`\n${mode}`);
-		for (const result of modeResults) {
-			const statuses = [...result.checks.values()];
-			const failed = statuses.filter((status) => status === "fail").length;
-			const passed = statuses.length - failed;
-			console.log(`  ${failed === 0 ? "pass" : "FAIL"} ${result.scenario} (${passed} passed, ${failed} failed)`);
-			for (const [id, status] of result.checks) {
-				if (status !== "fail") continue;
-				const message = result.messages.get(id)?.replace(/\s+/g, " ").slice(0, 300);
-				console.log(`         ${id}${message ? `: ${message}` : ""}`);
-			}
+	console.log(`\n${PROTOCOL_VERSION}`);
+	for (const result of results) {
+		const statuses = [...result.checks.values()];
+		const failed = statuses.filter((status) => status === "fail").length;
+		const passed = statuses.length - failed;
+		console.log(`  ${failed === 0 ? "pass" : "FAIL"} ${result.scenario} (${passed} passed, ${failed} failed)`);
+		for (const [id, status] of result.checks) {
+			if (status !== "fail") continue;
+			const message = result.messages.get(id)?.replace(/\s+/g, " ").slice(0, 300);
+			console.log(`         ${id}${message ? `: ${message}` : ""}`);
 		}
 	}
 }
@@ -264,7 +265,6 @@ function printResults(results: ScenarioResult[]): void {
 async function main(): Promise<number> {
 	const { values } = parseArgs({
 		options: {
-			mode: { type: "string", multiple: true },
 			scenario: { type: "string", multiple: true },
 			"update-baseline": { type: "boolean", default: false },
 			"keep-results": { type: "boolean", default: false },
@@ -276,7 +276,6 @@ async function main(): Promise<number> {
 		console.log(`Usage: node packages/coding-agent/test/mcp-conformance/run.ts [options]
 
 Options:
-  --mode <version>     Only run this protocol version (repeatable): ${MODES.join(", ")}
   --scenario <name>    Only run this scenario (repeatable)
   --update-baseline    Write the results to baseline.json instead of comparing
   --keep-results       Keep the upstream checks.json and client output
@@ -287,16 +286,15 @@ Options:
 		console.error("The conformance runner needs a POSIX shell.");
 		return 1;
 	}
-	const modes = values.mode ?? [...MODES];
-	for (const mode of modes) {
-		if (!(MODES as readonly string[]).includes(mode)) {
-			console.error(`Unsupported mode ${mode}. Supported: ${MODES.join(", ")}`);
+	const scenarios = values.scenario ?? SCENARIOS;
+	for (const scenario of scenarios) {
+		if (!SCENARIOS.includes(scenario)) {
+			console.error(`Unsupported scenario ${scenario}. Supported: ${SCENARIOS.join(", ")}`);
 			return 1;
 		}
 	}
-	const partial = values.mode !== undefined || values.scenario !== undefined;
-	if (values["update-baseline"] && partial) {
-		console.error("--update-baseline needs a full run, without --mode or --scenario.");
+	if (values["update-baseline"] && values.scenario) {
+		console.error("--update-baseline needs a full run, without --scenario.");
 		return 1;
 	}
 
@@ -311,22 +309,17 @@ Options:
 		chmodSync(launcher, 0o755);
 
 		const results: ScenarioResult[] = [];
-		for (const mode of modes) {
-			const scenarios = (await listScenarios(mode, workDir)).filter(
-				(scenario) => !values.scenario || values.scenario.includes(scenario),
-			);
-			for (const scenario of scenarios) {
-				process.stderr.write(`${mode} ${scenario}\n`);
-				results.push(await runScenario(mode, scenario, launcher, workDir, values.verbose));
-			}
-		}
-		if (results.length === 0) {
-			console.error("No scenarios matched.");
-			return 1;
+		for (const scenario of scenarios) {
+			process.stderr.write(`${PROTOCOL_VERSION} ${scenario}\n`);
+			results.push(await runScenario(scenario, launcher, workDir, values.verbose));
 		}
 		printResults(results);
 
 		if (values["update-baseline"]) {
+			if (results.some((result) => result.checks.has("runner"))) {
+				console.error("\nCannot update the baseline: the runner did not produce checks for every scenario.");
+				return 1;
+			}
 			writeFileSync(baselinePath, `${JSON.stringify(toBaseline(results), null, "\t")}\n`);
 			console.log(`\nWrote ${baselinePath}`);
 			return 0;
@@ -336,22 +329,15 @@ Options:
 			console.error("\nNo baseline.json. Run with --update-baseline and review it.");
 			return 1;
 		}
-		if (baseline.conformance !== CONFORMANCE_PACKAGE) {
-			console.error(`\nbaseline.json is for ${baseline.conformance}, not ${CONFORMANCE_PACKAGE}. Regenerate it.`);
+		if (baseline.conformance !== CONFORMANCE_PACKAGE || baseline.protocolVersion !== PROTOCOL_VERSION) {
+			console.error(`\nbaseline.json does not match ${CONFORMANCE_PACKAGE} on ${PROTOCOL_VERSION}. Regenerate it.`);
 			return 1;
 		}
-		const scoped: Baseline = partial
+		const scoped: Baseline = values.scenario
 			? {
-					conformance: baseline.conformance,
-					modes: Object.fromEntries(
-						modes.map((mode) => [
-							mode,
-							Object.fromEntries(
-								Object.entries(baseline.modes[mode] ?? {}).filter(
-									([scenario]) => !values.scenario || values.scenario.includes(scenario),
-								),
-							),
-						]),
+					...baseline,
+					scenarios: Object.fromEntries(
+						Object.entries(baseline.scenarios).filter(([scenario]) => scenarios.includes(scenario)),
 					),
 				}
 			: baseline;

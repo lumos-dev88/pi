@@ -40,14 +40,12 @@ interface ToolCall {
 function toolCalls(scenario: string, connection: McpServerConnection): ToolCall[] | undefined {
 	if (scenario.startsWith("auth/")) return [{ name: "test-tool", arguments: {} }];
 	switch (scenario) {
-		case "initialize":
+		case "request-metadata":
 			return [];
 		case "tools_call":
 			return [{ name: "add_numbers", arguments: { a: 2, b: 3 } }];
-		case "sse-retry":
-			return [{ name: "test_reconnection", arguments: {} }];
-		case "elicitation-sep1034-client-defaults":
-			return [{ name: "test_client_elicitation_defaults", arguments: {} }];
+		case "http-standard-headers":
+			return [{ name: "test_headers", arguments: {} }];
 		case "json-schema-2020-12-preservation": {
 			// The server compares the echoed schema with the one it listed, to detect dropped keywords.
 			const tool = connection.tools.find((candidate) => candidate.name === "json_schema_2020_12_tool");
@@ -170,6 +168,10 @@ async function run(serverUrl: string, scenario: string): Promise<void> {
 			const result = await withSignIn(() => connection.callTool(call.name, call.arguments, {}));
 			log(`${call.name}: ${JSON.stringify(result.content)}`);
 			if (result.isError) throw new Error(`Tool ${call.name} failed: ${JSON.stringify(result.content)}`);
+		}
+		if (scenario === "http-standard-headers") {
+			const resources = await connection.allResources({});
+			for (const { uri } of resources) await connection.readResource(uri, {});
 		}
 	} finally {
 		await connection.close();

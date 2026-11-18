@@ -55,9 +55,6 @@ export {
 	type CancelledNotification,
 	type ClientCapabilities,
 	type Implementation,
-	type InitializeParams,
-	type InitializeResult,
-	LATEST_PROTOCOL_VERSION,
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
 	type ListToolsResult,
@@ -67,12 +64,9 @@ export {
 	type ResourceTemplate,
 	type Root,
 	type ServerCapabilities,
-	SUPPORTED_PROTOCOL_VERSIONS,
-	type SupportedProtocolVersion,
 	TASKS_PROTOCOL_VERSION,
 	type Tool,
 	type ToolAnnotations,
-	type ToolExecution,
 } from "./protocol/types.ts";
 export {
 	type McpPipe,
@@ -84,7 +78,6 @@ export { StdioTransport, type StdioTransportOptions } from "./transports/stdio.t
 export {
 	McpAuthRequiredError,
 	McpHttpError,
-	McpSessionExpiredError,
 	StreamableHttpTransport,
 	type StreamableHttpTransportOptions,
 } from "./transports/streamable-http.ts";

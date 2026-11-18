@@ -16,15 +16,14 @@ export interface McpTransportSendOptions {
 }
 
 export interface McpTransport {
-	/** Stateless HTTP cancels a request by closing its response stream, not by sending a notification. */
-	readonly modernRequestCancellation?: "stream";
+	/** HTTP cancels a request by closing its response stream, not by sending a notification. */
+	readonly requestCancellation?: "stream";
 	start(): Promise<void>;
 	send(message: JsonRpcMessage, options?: McpTransportSendOptions): Promise<void>;
 	close(): Promise<void>;
 	onMessage(listener: McpTransportMessageListener): () => void;
 	onError(listener: McpTransportErrorListener): () => void;
 	onClose(listener: McpTransportCloseListener): () => void;
-	setProtocolVersion?(version: string): void;
 }
 
 /** Listener bookkeeping shared by transports. `emitClose` fires at most once per transport. */

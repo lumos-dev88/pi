@@ -19,7 +19,7 @@ import { type ConnectEnv, EnvConnections } from "./environments.ts";
 import type { InstanceSpec, Placement } from "./placement.ts";
 import { type AuthProviders, DaemonTooOldError, type Opened, type Transports, transportsFor } from "./transports.ts";
 
-/** How the p2 server names itself to MCP servers (`initialize`'s `clientInfo`). */
+/** How the p2 server identifies itself in MCP request metadata. */
 export type ClientInfo = { readonly name: string; readonly version: string };
 
 /** Reconnect waits: the first, the cap of their doubling, and how long a connection lasts to start over at the first. */
@@ -178,7 +178,7 @@ class Connection {
 	#status: Instance["status"] = "starting";
 	#failure: Failure | undefined;
 	#tools: readonly McpTool[];
-	/** The server's instructions from its last `initialize`, kept while it reconnects. */
+	/** The server's instructions from its last `server/discover` response, kept while it reconnects. */
 	#instructions: string | undefined;
 	#delayMs: number;
 

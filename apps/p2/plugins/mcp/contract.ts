@@ -76,7 +76,7 @@ export const InstanceSchema = obj({
 	error: opt(str()),
 	/** Kept while it reconnects. */
 	tools: arr(ToolSchema),
-	/** The server's instructions from `initialize`, if it sent any; kept while it reconnects. */
+	/** The server's instructions from `server/discover`, if it sent any; kept while it reconnects. */
 	instructions: opt(str()),
 	/** What the server offers, in a sentence, as its configuration's `description` says (absent: not configured). */
 	description: opt(str()),
@@ -256,7 +256,7 @@ export type SessionLease = Static<typeof SessionLeaseSchema>;
 /**
  * MCP servers as a principal sees them: a session worker sets its locations and calls tools (its session, generation
  * and incarnation from the link), the owner sees every instance with its errors and sign-ins, restarts them and signs in
- * and out of HTTP servers. Nobody else gets one. 3: an instance's `instructions` (the server's own, from `initialize`);
+ * and out of HTTP servers. Nobody else gets one. 3: an instance's `instructions` from `server/discover`;
  * 4: its configured `description`, and the worker's `leases` (which instances each location uses: a project override
  * decides per lease, also for instances serving every location); the provider still serves 2 and 3 (`MCP_ACCEPTS`).
  */

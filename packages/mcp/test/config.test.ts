@@ -3,7 +3,6 @@ import {
 	isMcpServerOverride,
 	type McpServerConfigOptions,
 	type McpServerConfigResult,
-	TASKS_PROTOCOL_VERSION,
 	validateMcpServerConfig,
 } from "../src/index.ts";
 
@@ -31,14 +30,6 @@ describe("validateMcpServerConfig", () => {
 		for (const type of ["http", "streamable-http"]) {
 			expect(validateMcpServerConfig("docs", { type, url: "http://localhost:3000/mcp" }).kind).toBe("http");
 		}
-	});
-
-	it("accepts the stateless protocol version and rejects an unknown version", () => {
-		const modern = { command: "node", protocolVersion: TASKS_PROTOCOL_VERSION };
-		expect(validateMcpServerConfig("tasks", modern)).toEqual({ kind: "stdio", config: modern });
-		expect(errorOf(validateMcpServerConfig("tasks", { ...modern, protocolVersion: "2099-01-01" }))).toContain(
-			"protocolVersion must be one of",
-		);
 	});
 
 	it("picks the transport from type, url and command", () => {

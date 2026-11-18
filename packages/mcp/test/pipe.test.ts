@@ -76,7 +76,7 @@ async function startFake(options: Omit<PipeTransportOptions, "open"> = {}): Prom
 /** Let the transport's reactions to `exited` run. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
-const ping = (id: number) => ({ jsonrpc: "2.0", id, method: "ping" }) as const;
+const reply = (id: number) => ({ jsonrpc: "2.0", id, result: {} }) as const;
 
 afterEach(() => {
 	vi.useRealTimers();
@@ -85,34 +85,34 @@ afterEach(() => {
 describe("PipeTransport framing", () => {
 	it("joins messages split across chunks and splits several messages in one chunk", async () => {
 		const program = await startFake();
-		const [first, second, third] = [ping(1), ping(2), ping(3)].map((message) => JSON.stringify(message));
+		const [first, second, third] = [reply(1), reply(2), reply(3)].map((message) => JSON.stringify(message));
 		program.stdout(first.slice(0, 10));
 		program.stdout(`${first.slice(10)}\n${second}`);
 		program.stdout(`\n${third}\n`);
-		expect(program.messages).toEqual([ping(1), ping(2), ping(3)]);
+		expect(program.messages).toEqual([reply(1), reply(2), reply(3)]);
 		expect(program.errors).toEqual([]);
 	});
 
 	it("strips a trailing carriage return and skips blank lines", async () => {
 		const program = await startFake();
-		program.stdout(`\n\r\n   \n${JSON.stringify(ping(1))}\r\n\n`);
-		expect(program.messages).toEqual([ping(1)]);
+		program.stdout(`\n\r\n   \n${JSON.stringify(reply(1))}\r\n\n`);
+		expect(program.messages).toEqual([reply(1)]);
 		expect(program.errors).toEqual([]);
 	});
 
 	it("reports invalid messages and keeps reading", async () => {
 		const program = await startFake();
-		program.stdout(`not json\n{"jsonrpc":"1.0"}\n${JSON.stringify(ping(1))}\n`);
-		expect(program.messages).toEqual([ping(1)]);
+		program.stdout(`not json\n{"jsonrpc":"1.0"}\n${JSON.stringify(reply(1))}\n`);
+		expect(program.messages).toEqual([reply(1)]);
 		expect(program.errors).toHaveLength(2);
 	});
 
 	it("drops messages over maxMessageBytes, complete or not", async () => {
 		const program = await startFake({ maxMessageBytes: 48 });
-		program.stdout(`${JSON.stringify({ jsonrpc: "2.0", method: "x".repeat(48) })}\n${JSON.stringify(ping(1))}\n`);
+		program.stdout(`${JSON.stringify({ jsonrpc: "2.0", method: "x".repeat(48) })}\n${JSON.stringify(reply(1))}\n`);
 		program.stdout("y".repeat(49));
-		program.stdout(`\n${JSON.stringify(ping(2))}\n`);
-		expect(program.messages).toEqual([ping(1), ping(2)]);
+		program.stdout(`\n${JSON.stringify(reply(2))}\n`);
+		expect(program.messages).toEqual([reply(1), reply(2)]);
 		expect(program.errors.map((error) => error.message)).toEqual([
 			"MCP stdio message exceeds 48 bytes",
 			"MCP stdio message exceeds 48 bytes",
@@ -132,8 +132,8 @@ describe("PipeTransport framing", () => {
 describe("PipeTransport lifecycle", () => {
 	it("writes each message as one line", async () => {
 		const program = await startFake();
-		await program.transport.send(ping(1));
-		expect(program.written).toEqual([`${JSON.stringify(ping(1))}\n`]);
+		await program.transport.send(reply(1));
+		expect(program.written).toEqual([`${JSON.stringify(reply(1))}\n`]);
 	});
 
 	it("reports an incomplete message when the program exits, then closes", async () => {
@@ -159,12 +159,12 @@ describe("PipeTransport lifecycle", () => {
 		const closedByUs = await startFake();
 		closedByUs.exit();
 		await closedByUs.transport.close();
-		await expect(closedByUs.transport.send(ping(1))).rejects.toBeInstanceOf(McpConnectionClosedError);
+		await expect(closedByUs.transport.send(reply(1))).rejects.toBeInstanceOf(McpConnectionClosedError);
 
 		const ended = await startFake();
 		ended.exit();
 		await settle();
-		await expect(ended.transport.send(ping(1))).rejects.toBeInstanceOf(McpConnectionClosedError);
+		await expect(ended.transport.send(reply(1))).rejects.toBeInstanceOf(McpConnectionClosedError);
 		expect(ended.written).toEqual([]);
 	});
 
@@ -172,7 +172,7 @@ describe("PipeTransport lifecycle", () => {
 		const program = await startFake();
 		const closing = program.transport.close();
 		expect(program.calls).toEqual(["closeStdin"]);
-		await expect(program.transport.send(ping(1))).rejects.toBeInstanceOf(McpConnectionClosedError);
+		await expect(program.transport.send(reply(1))).rejects.toBeInstanceOf(McpConnectionClosedError);
 		expect(program.written).toEqual([]);
 		program.exit();
 		await closing;
@@ -249,13 +249,19 @@ function spawnPipe(argv: readonly string[], handlers: McpPipeHandlers): Promise<
 }
 
 describe("PipeTransport with a real program", () => {
-	it("runs initialize, tools/list and tools/call", async () => {
+	it("runs server/discover, tools/list and tools/call", async () => {
 		const transport = new PipeTransport({ open: (handlers) => spawnPipe([process.execPath, fixture], handlers) });
 		const client = new McpClient({ name: "pipe-test", version: "1.0.0" });
 		const result = await client.connect(transport);
 		expect(result.serverInfo).toEqual({ name: "stdio-fixture", version: "1.0.0" });
-		expect(await client.listTools()).toEqual([{ name: "echo", inputSchema: { type: "object" } }]);
+		expect(await client.listTools()).toEqual([
+			{
+				name: "echo",
+				inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+			},
+		]);
 		expect(await client.callTool("echo", { text: "hello" })).toEqual({
+			resultType: "complete",
 			content: [{ type: "text", text: "hello" }],
 		});
 		expect(transport.stderr).toContain("stdio fixture ready");

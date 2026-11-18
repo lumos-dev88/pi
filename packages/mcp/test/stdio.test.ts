@@ -1,6 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { McpClient, StdioTransport } from "../src/index.ts";
+import { McpClient, StdioTransport, TASKS_PROTOCOL_VERSION } from "../src/index.ts";
 
 const fixture = fileURLToPath(new URL("./fixtures/stdio-server.mjs", import.meta.url));
 const stubborn = fileURLToPath(new URL("./fixtures/stubborn-server.mjs", import.meta.url));
@@ -33,9 +33,16 @@ describe("StdioTransport", () => {
 			onStderr: (chunk) => stderr.push(chunk),
 		});
 		const client = new McpClient({ name: "stdio-test", version: "1.0.0" });
-		await client.connect(transport);
-		expect(await client.listTools()).toEqual([{ name: "echo", inputSchema: { type: "object" } }]);
+		const connection = await client.connect(transport);
+		expect(connection.protocolVersion).toBe(TASKS_PROTOCOL_VERSION);
+		expect(await client.listTools()).toEqual([
+			{
+				name: "echo",
+				inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+			},
+		]);
 		expect(await client.callTool("echo", { text: "hello" })).toEqual({
+			resultType: "complete",
 			content: [{ type: "text", text: "hello" }],
 		});
 		expect(transport.pid).toBeTypeOf("number");

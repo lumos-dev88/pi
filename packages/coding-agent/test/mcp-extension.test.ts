@@ -7,10 +7,9 @@ import { renderToolOutputType } from "@earendil-works/pi-codemode/declarations";
 import {
 	createMcpToolName,
 	type JsonRpcMessage,
-	LATEST_PROTOCOL_VERSION,
 	McpAuthRequiredError,
 	McpHttpError,
-	McpSessionExpiredError,
+	TASKS_PROTOCOL_VERSION,
 } from "@earendil-works/pi-mcp";
 import { createInMemoryTransportPair, type InMemoryTransport } from "@earendil-works/pi-mcp/testing";
 import { afterEach, describe, expect, it } from "vitest";
@@ -453,47 +452,46 @@ describe("MCP tools", () => {
 describe("MCP connections", () => {
 	const servers: InMemoryTransport[] = [];
 
-	/** In-memory server that answers initialize, tools/list, and tools/call with "ok". */
-	function createTransport(
-		options: { expireFirstCall?: boolean; methods?: string[]; noTools?: boolean; resources?: boolean } = {},
-	) {
+	/** In-memory server that discovers capabilities and answers tool calls with "ok". */
+	function createTransport(options: { methods?: string[]; noTools?: boolean; resources?: boolean } = {}) {
 		const pair = createInMemoryTransportPair();
 		servers.push(pair.server);
 		pair.server.onMessage((message) => {
 			if (!("id" in message) || !("method" in message)) return;
 			options.methods?.push(message.method);
 			const response: JsonRpcMessage =
-				message.method === "initialize"
+				message.method === "server/discover"
 					? {
 							jsonrpc: "2.0",
 							id: message.id,
 							result: {
-								protocolVersion: LATEST_PROTOCOL_VERSION,
+								resultType: "complete",
+								supportedVersions: [TASKS_PROTOCOL_VERSION],
 								capabilities: {
 									...(options.noTools ? { prompts: {} } : { tools: {} }),
 									...(options.resources ? { resources: {} } : {}),
 								},
-								serverInfo: { name: "fake", version: "1.0.0" },
+								_meta: { "io.modelcontextprotocol/serverInfo": { name: "fake", version: "1.0.0" } },
 							},
 						}
 					: message.method === "tools/list"
 						? options.noTools
 							? { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } }
-							: { jsonrpc: "2.0", id: message.id, result: { tools: [] } }
+							: { jsonrpc: "2.0", id: message.id, result: { resultType: "complete", tools: [] } }
 						: message.method === "resources/read"
-							? { jsonrpc: "2.0", id: message.id, result: { contents: [{ uri: "docs://a", text: "ok" }] } }
-							: { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: "ok" }] } };
+							? {
+									jsonrpc: "2.0",
+									id: message.id,
+									result: { resultType: "complete", contents: [{ uri: "docs://a", text: "ok" }] },
+								}
+							: {
+									jsonrpc: "2.0",
+									id: message.id,
+									result: { resultType: "complete", content: [{ type: "text", text: "ok" }] },
+								};
 			queueMicrotask(() => void pair.server.send(response));
 		});
 		void pair.server.start();
-		if (options.expireFirstCall) {
-			const send = pair.client.send.bind(pair.client);
-			// Simulates the HTTP transport's 404 for a session the server no longer knows.
-			pair.client.send = async (message: JsonRpcMessage) => {
-				if ("method" in message && message.method === "tools/call") throw new McpSessionExpiredError("gone");
-				return send(message);
-			};
-		}
 		return pair.client;
 	}
 
@@ -514,20 +512,6 @@ describe("MCP connections", () => {
 		return { connection, opened: () => opened };
 	}
 
-	it("starts a new session and retries once when the session expired", async () => {
-		const { connection, opened } = connect({ name: "fake", config: { command: "unused" }, source: "test" }, [
-			() => createTransport({ expireFirstCall: true }),
-			() => createTransport(),
-		]);
-		const results = await Promise.all([connection.callTool("echo", {}, {}), connection.callTool("echo", {}, {})]);
-		expect(results).toEqual([
-			{ content: [{ type: "text", text: "ok" }] },
-			{ content: [{ type: "text", text: "ok" }] },
-		]);
-		expect(opened()).toBe(2);
-		await connection.close();
-	});
-
 	it.skipIf(process.platform === "win32")(
 		"expands ~ in the command, arguments, and cwd of stdio servers",
 		async () => {
@@ -542,11 +526,11 @@ describe("MCP connections", () => {
 for await (const line of createInterface({ input: process.stdin })) {
 	const message = JSON.parse(line);
 	if (!("id" in message)) continue;
-	const result = message.method === "initialize"
-		? { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "cwd", version: "1" } }
+	const result = message.method === "server/discover"
+		? { resultType: "complete", supportedVersions: ["${TASKS_PROTOCOL_VERSION}"], capabilities: { tools: {} } }
 		: message.method === "tools/list"
-			? { tools: [{ name: "cwd", inputSchema: { type: "object" } }] }
-			: { content: [{ type: "text", text: process.cwd() }] };
+			? { resultType: "complete", tools: [{ name: "cwd", inputSchema: { type: "object" } }] }
+			: { resultType: "complete", content: [{ type: "text", text: process.cwd() }] };
 	process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
 }`,
 			);
@@ -580,7 +564,7 @@ for await (const line of createInterface({ input: process.stdin })) {
 		await connection.getClient();
 		expect(connection.state).toBe("connected");
 		expect(connection.tools).toEqual([]);
-		expect(methods).toEqual(["initialize"]);
+		expect(methods).toEqual(["server/discover"]);
 		await connection.close();
 	});
 
@@ -594,7 +578,10 @@ for await (const line of createInterface({ input: process.stdin })) {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(connection.state).toBe("disconnected");
 		expect(connection.error).toBe("Connection closed");
-		expect(await connection.callTool("echo", {}, {})).toEqual({ content: [{ type: "text", text: "ok" }] });
+		expect(await connection.callTool("echo", {}, {})).toEqual({
+			resultType: "complete",
+			content: [{ type: "text", text: "ok" }],
+		});
 		expect(connection.state).toBe("connected");
 		expect(opened()).toBe(2);
 		await connection.close();
@@ -637,12 +624,11 @@ for await (const line of createInterface({ input: process.stdin })) {
 	});
 
 	// #10249
-	it("closes a connection that is still initializing before close returns", async () => {
+	it("closes a connection that is still discovering before close returns", async () => {
 		const pair = createInMemoryTransportPair();
-		// The server receives initialize but never answers it.
-		const initializing = new Promise<void>((resolve) => {
-			pair.server.onMessage(() => resolve());
-		});
+		// The server receives server/discover but never answers it.
+		const discovering = Promise.withResolvers<void>();
+		pair.server.onMessage(() => discovering.resolve());
 		void pair.server.start();
 		let transportClosed = false;
 		pair.client.onClose(() => {
@@ -655,7 +641,7 @@ for await (const line of createInterface({ input: process.stdin })) {
 		void connection.getClient().catch((error) => {
 			failure = error;
 		});
-		await initializing;
+		await discovering.promise;
 		await connection.close();
 		expect(transportClosed).toBe(true);
 		expect(String(failure)).toContain("failed to connect");
@@ -701,7 +687,10 @@ for await (const line of createInterface({ input: process.stdin })) {
 		const { connection } = connect({ name: "fake", config: { command: "unused" }, source: "test" }, [
 			() => transport,
 		]);
-		expect(await connection.readResource("docs://a", {})).toEqual({ contents: [{ uri: "docs://a", text: "ok" }] });
+		expect(await connection.readResource("docs://a", {})).toEqual({
+			resultType: "complete",
+			contents: [{ uri: "docs://a", text: "ok" }],
+		});
 		await expect(connection.callTool("echo", {}, {})).rejects.toThrow("status 502");
 		await connection.close();
 	});
@@ -794,7 +783,10 @@ for await (const line of createInterface({ input: process.stdin })) {
 			},
 			[() => createTransport()],
 		);
-		expect(await connection.callTool("echo", {}, {})).toEqual({ content: [{ type: "text", text: "ok" }] });
+		expect(await connection.callTool("echo", {}, {})).toEqual({
+			resultType: "complete",
+			content: [{ type: "text", text: "ok" }],
+		});
 		expect(() => connection.oauthSettings()).toThrow("oauth.clientSecret");
 		await connection.close();
 	});
@@ -808,7 +800,7 @@ for await (const line of createInterface({ input: process.stdin })) {
 		await connection.getClient();
 		expect(connection.state).toBe("connected");
 		expect(connection.hasResources).toBe(true);
-		expect(methods).toEqual(["initialize", "tools/list"]);
+		expect(methods).toEqual(["server/discover", "tools/list"]);
 		await connection.close();
 	});
 });

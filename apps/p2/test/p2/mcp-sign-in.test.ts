@@ -126,18 +126,18 @@ async function authorizationServer(t: { after(fn: () => unknown): void }) {
 						})
 						.end();
 				if (request.method !== "POST") return response.writeHead(405).end();
-				const message = JSON.parse(body) as { id?: number; method: string };
-				if (message.id === undefined) return response.writeHead(202).end();
+				const message = JSON.parse(body) as { id: number; method: string };
 				const result =
-					message.method === "initialize"
+					message.method === "server/discover"
 						? {
-								protocolVersion: "2025-06-18",
+								resultType: "complete",
+								supportedVersions: ["2026-07-28"],
 								capabilities: { tools: {} },
-								serverInfo: { name: "oauth-fixture", version: "1.0.0" },
+								_meta: { "io.modelcontextprotocol/serverInfo": { name: "oauth-fixture", version: "1.0.0" } },
 							}
 						: message.method === "tools/list"
-							? { tools: [{ name: "whoami", inputSchema: { type: "object" } }] }
-							: { content: [{ type: "text", text: token }] };
+							? { resultType: "complete", tools: [{ name: "whoami", inputSchema: { type: "object" } }] }
+							: { resultType: "complete", content: [{ type: "text", text: token }] };
 				return json(response, 200, { jsonrpc: "2.0", id: message.id, result });
 			}
 			default:

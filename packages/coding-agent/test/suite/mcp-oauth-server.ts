@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { LATEST_PROTOCOL_VERSION } from "@earendil-works/pi-mcp";
+import { TASKS_PROTOCOL_VERSION } from "@earendil-works/pi-mcp";
 
 async function readBody(request: IncomingMessage): Promise<string> {
 	const chunks: Buffer[] = [];
@@ -8,8 +8,8 @@ async function readBody(request: IncomingMessage): Promise<string> {
 	return Buffer.concat(chunks).toString("utf8");
 }
 
-function json(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-	response.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body));
+function json(response: ServerResponse, status: number, body: unknown): void {
+	response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
 }
 
 /**
@@ -17,8 +17,7 @@ function json(response: ServerResponse, status: number, body: unknown, headers: 
  * `iss` is sent as the `iss` parameter of authorization responses (RFC 9207). `issParameter` advertises
  * that parameter and sends the server's issuer. `cimd` advertises Client ID Metadata Documents.
  * `redirectPath` replaces the path of the redirect URI, like a mixed-up authorization server.
- * The MCP endpoint assigns a session, so closing a connection sends a DELETE. Paths added to `stall`
- * accept requests and never answer them, like an unresponsive server.
+ * Paths added to `stall` accept requests and never answer them, like an unresponsive server.
  */
 export async function startOAuthMcpServer(
 	options: { iss?: string; issParameter?: boolean; cimd?: boolean; redirectPath?: string } = {},
@@ -27,7 +26,7 @@ export async function startOAuthMcpServer(
 	const registrations: Record<string, unknown>[] = [];
 	const authorizations: URLSearchParams[] = [];
 	const tokenRequests: URLSearchParams[] = [];
-	const deletes: (string | undefined)[] = [];
+	const mcpMethods: (string | undefined)[] = [];
 	const stall = new Set<string>();
 	const stalled: { path: string; request: IncomingMessage }[] = [];
 	const validTokens = new Set<string>();
@@ -45,12 +44,12 @@ export async function startOAuthMcpServer(
 	};
 
 	const handleMcp = async (request: IncomingMessage, response: ServerResponse) => {
-		const token = request.headers.authorization?.replace(/^Bearer /, "");
-		if (request.method === "DELETE") deletes.push(token);
+		mcpMethods.push(request.method);
 		if (request.method !== "POST") {
-			response.writeHead(request.method === "GET" ? 405 : 200).end();
+			response.writeHead(405).end();
 			return;
 		}
+		const token = request.headers.authorization?.replace(/^Bearer /, "");
 		if (!token || !validTokens.has(token)) {
 			log.push(`401 ${token ?? "none"}`);
 			response
@@ -66,21 +65,25 @@ export async function startOAuthMcpServer(
 			return;
 		}
 		let result: unknown;
-		if (message.method === "initialize") {
+		if (message.method === "server/discover") {
 			result = {
-				protocolVersion: LATEST_PROTOCOL_VERSION,
+				resultType: "complete",
+				supportedVersions: [TASKS_PROTOCOL_VERSION],
 				capabilities: { tools: {} },
-				serverInfo: { name: "issues", version: "1.0.0" },
+				_meta: { "io.modelcontextprotocol/serverInfo": { name: "issues", version: "1.0.0" } },
 			};
 		} else if (message.method === "tools/list") {
-			result = { tools: [{ name: "whoami", inputSchema: { type: "object", properties: {} } }] };
+			result = {
+				resultType: "complete",
+				tools: [{ name: "whoami", inputSchema: { type: "object", properties: {} } }],
+			};
 		} else if (message.method === "tools/call") {
 			log.push(`call ${token}`);
-			result = { content: [{ type: "text", text: `token ${token}` }] };
+			result = { resultType: "complete", content: [{ type: "text", text: `token ${token}` }] };
 		} else {
 			result = {};
 		}
-		json(response, 200, { jsonrpc: "2.0", id: message.id, result }, { "mcp-session-id": "session-1" });
+		json(response, 200, { jsonrpc: "2.0", id: message.id, result });
 	};
 
 	const handle = async (request: IncomingMessage, response: ServerResponse) => {
@@ -166,8 +169,8 @@ export async function startOAuthMcpServer(
 		authorizations,
 		/** Parameters of token requests. */
 		tokenRequests,
-		/** Access tokens of session DELETE requests. */
-		deletes,
+		/** HTTP methods received at the MCP endpoint. */
+		mcpMethods,
 		stall,
 		/** Requests to stalled paths, still open unless the client gave up. */
 		stalled,

@@ -19,7 +19,6 @@ import {
 	McpError,
 	McpHttpError,
 	type McpRequestOptions,
-	McpSessionExpiredError,
 	type Tool as McpTool,
 	type McpTransport,
 	type ReadResourceResult,
@@ -148,7 +147,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	 * not listed at connect: listing every resource can take long (a large drive, say).
 	 */
 	hasResources = false;
-	/** Server instructions from `initialize`, describing its tools as a group. */
+	/** Server instructions from discovery, describing its tools as a group. */
 	instructions: string | undefined;
 	/** Last OAuth challenge from the server; sign-in uses its resource metadata URL and scope. */
 	challenge: OAuthChallenge | undefined;
@@ -287,13 +286,6 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 					await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_DELAYS_MS[0]));
 					continue;
 				}
-				if (error instanceof McpSessionExpiredError && attempt === 1) {
-					// The server no longer knows the session (restart, deploy), so it did not run the request.
-					// Retry once on a new session. The old client is detached but not closed: closing would
-					// fail its other in-flight calls, which instead get the same 404 and retry the same way.
-					if (this.client === client) this.client = undefined;
-					continue;
-				}
 				if (!this.needsSignIn(error)) throw error;
 				await this.dropClient(client);
 				this.markNeedsAuth();
@@ -362,13 +354,12 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		const client = new McpClient({
 			name: "pi",
 			version: VERSION,
-			protocolVersion: this.entry.config.protocolVersion,
 			requestTimeoutMs: this.timeoutMs,
 			roots: [{ uri: pathToFileURL(this.cwd).href, name: basename(this.cwd) }],
 		});
 		const log = this.log;
 		if (log) client.onNotification("notifications/message", (params) => log.write(this.entry.name, params));
-		// Closing the client fails its pending initialize or discovery requests and closes the transport.
+		// Closing the client fails pending discovery requests and closes the transport.
 		// Memoized: a second `client.close()` returns before the first finished closing the transport.
 		let closing: Promise<void> | undefined;
 		const closeClient = () => {

@@ -3,7 +3,6 @@ import type { CallToolResult } from "./protocol/content.ts";
 import {
 	isJsonRpcId,
 	isJsonRpcNotification,
-	isJsonRpcRequest,
 	isJsonRpcResponse,
 	isObject,
 	JSON_RPC_ERROR_CODES,
@@ -23,10 +22,9 @@ import {
 	CLIENT_INFO_META,
 	type ClientCapabilities,
 	type Implementation,
-	type InitializeResult,
-	LATEST_PROTOCOL_VERSION,
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
+	LOG_LEVEL_META,
 	PROTOCOL_VERSION_META,
 	type ProgressNotification,
 	type ReadResourceResult,
@@ -35,8 +33,7 @@ import {
 	type Root,
 	SERVER_INFO_META,
 	type ServerCapabilities,
-	SUPPORTED_PROTOCOL_VERSIONS,
-	type SupportedProtocolVersion,
+	SUBSCRIPTION_ID_META,
 	TASKS_EXTENSION,
 	TASKS_PROTOCOL_VERSION,
 	type Tool,
@@ -45,6 +42,7 @@ import type { McpTransport } from "./transports/transport.ts";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_LIST_PAGES = 1_000;
+const TOOLS_LIST_CHANGED = "notifications/tools/list_changed";
 
 type ClientState = "idle" | "connecting" | "connected" | "closed";
 type NotificationListener = (params: unknown) => void;
@@ -52,9 +50,14 @@ type ErrorListener = (error: Error) => void;
 type CloseListener = () => void;
 type RequestHandler = (params: unknown, context: { signal: AbortSignal }) => unknown | Promise<unknown>;
 
+interface ToolSubscription {
+	controller: AbortController;
+	requestId?: JsonRpcId;
+	acknowledged: boolean;
+}
+
 export interface McpClientOptions extends Implementation {
 	capabilities?: ClientCapabilities;
-	protocolVersion?: SupportedProtocolVersion;
 	requestTimeoutMs?: number;
 	roots?: readonly Root[] | (() => readonly Root[] | Promise<readonly Root[]>);
 }
@@ -66,9 +69,14 @@ export interface McpRequestOptions {
 }
 
 /** Connection information; stateless servers may omit their identity. */
-export type McpConnectionInfo = Omit<InitializeResult, "serverInfo"> & { serverInfo?: Implementation };
+export interface McpConnectionInfo {
+	protocolVersion: typeof TASKS_PROTOCOL_VERSION;
+	capabilities: ServerCapabilities;
+	serverInfo?: Implementation;
+	instructions?: string;
+}
 
-interface ModernMetadata extends Record<string, unknown> {
+interface RequestMetadata extends Record<string, unknown> {
 	[PROTOCOL_VERSION_META]: typeof TASKS_PROTOCOL_VERSION;
 	[CLIENT_CAPABILITIES_META]: ClientCapabilities;
 	[CLIENT_INFO_META]: Implementation;
@@ -84,24 +92,8 @@ interface PendingRequest {
 	/** Aborted when the request settles, so the transport does not dispatch (or retry) it afterwards. */
 	sendController: AbortController;
 	mayCreateTask: boolean;
-	cancellable: boolean;
 	onProgress: ((progress: ProgressNotification) => void) | undefined;
 	progressToken: JsonRpcId | undefined;
-}
-
-function validateInitializeResult(value: unknown): InitializeResult {
-	if (
-		!isObject(value) ||
-		typeof value.protocolVersion !== "string" ||
-		!isObject(value.capabilities) ||
-		!isObject(value.serverInfo) ||
-		typeof value.serverInfo.name !== "string" ||
-		typeof value.serverInfo.version !== "string" ||
-		(value.instructions !== undefined && typeof value.instructions !== "string")
-	) {
-		throw new McpError(JSON_RPC_ERROR_CODES.invalidRequest, "Invalid MCP initialize result");
-	}
-	return value as unknown as InitializeResult;
 }
 
 function invalid(message: string): McpError {
@@ -204,13 +196,13 @@ export class McpClient {
 	private serverInfoValue: Implementation | undefined;
 	private serverCapabilitiesValue: ServerCapabilities | undefined;
 	private instructionsValue: string | undefined;
-	private protocolVersionValue: string | undefined;
-	private modernMetadata: ModernMetadata | undefined;
-	private tasks: { metadata: ModernMetadata; lifetime: AbortController } | undefined;
+	private protocolVersionValue: typeof TASKS_PROTOCOL_VERSION | undefined;
+	private readonly metadata: RequestMetadata;
+	private tasks: { metadata: RequestMetadata; lifetime: AbortController } | undefined;
+	private toolSubscription: ToolSubscription | undefined;
 	private lateTasks: Map<JsonRpcId, NodeJS.Timeout> | undefined;
 	private pending = new Map<JsonRpcId, PendingRequest>();
 	private progressRequests = new Map<JsonRpcId, JsonRpcId>();
-	private incoming = new Map<JsonRpcId, AbortController>();
 	private requestHandlers = new Map<string, RequestHandler>();
 	private notificationListeners = new Map<string, Set<NotificationListener>>();
 	private errorListeners = new Set<ErrorListener>();
@@ -219,7 +211,18 @@ export class McpClient {
 
 	constructor(options: McpClientOptions) {
 		this.options = Object.freeze({ ...options });
-		this.requestHandlers.set("ping", () => ({}));
+		const capabilities = { ...options.capabilities };
+		if (options.roots && capabilities.roots === undefined) capabilities.roots = {};
+		const { [TASKS_EXTENSION]: _tasks, ...extensions } = capabilities.extensions ?? {};
+		this.metadata = {
+			[PROTOCOL_VERSION_META]: TASKS_PROTOCOL_VERSION,
+			[CLIENT_INFO_META]: {
+				name: options.name,
+				version: options.version,
+				...(options.title === undefined ? {} : { title: options.title }),
+			},
+			[CLIENT_CAPABILITIES_META]: { ...capabilities, extensions },
+		};
 		const roots = options.roots;
 		if (roots) {
 			this.requestHandlers.set("roots/list", async () => ({
@@ -244,7 +247,7 @@ export class McpClient {
 		return this.instructionsValue;
 	}
 
-	get protocolVersion(): string | undefined {
+	get protocolVersion(): typeof TASKS_PROTOCOL_VERSION | undefined {
 		return this.protocolVersionValue;
 	}
 
@@ -261,64 +264,27 @@ export class McpClient {
 
 		try {
 			await transport.start();
-			const capabilities: ClientCapabilities = { ...this.options.capabilities };
-			if (this.options.roots && capabilities.roots === undefined) capabilities.roots = {};
-			const clientInfo: Implementation = {
-				name: this.options.name,
-				version: this.options.version,
-				...(this.options.title === undefined ? {} : { title: this.options.title }),
-			};
-			const preferredVersion = this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION;
-			const modern = preferredVersion === TASKS_PROTOCOL_VERSION;
-			let result: McpConnectionInfo;
-			if (modern) {
-				const { [TASKS_EXTENSION]: _tasks, ...extensions } = capabilities.extensions ?? {};
-				capabilities.extensions = extensions;
-				this.modernMetadata = {
-					[PROTOCOL_VERSION_META]: TASKS_PROTOCOL_VERSION,
-					[CLIENT_INFO_META]: clientInfo,
-					[CLIENT_CAPABILITIES_META]: capabilities,
-				};
-				transport.setProtocolVersion?.(TASKS_PROTOCOL_VERSION);
-				result = validateDiscoverResult(await this.requestInternal("server/discover", undefined, {}, true));
-				const serverExtensions = result.capabilities.extensions;
-				if (isObject(serverExtensions) && Object.hasOwn(serverExtensions, TASKS_EXTENSION)) {
-					this.tasks = {
-						metadata: {
-							...this.modernMetadata,
-							[CLIENT_CAPABILITIES_META]: {
-								...capabilities,
-								extensions: { ...extensions, [TASKS_EXTENSION]: {} },
-							},
+			const result = validateDiscoverResult(await this.requestInternal("server/discover", undefined, {}, true));
+			const serverExtensions = result.capabilities.extensions;
+			if (isObject(serverExtensions) && Object.hasOwn(serverExtensions, TASKS_EXTENSION)) {
+				const capabilities = this.metadata[CLIENT_CAPABILITIES_META];
+				this.tasks = {
+					metadata: {
+						...this.metadata,
+						[CLIENT_CAPABILITIES_META]: {
+							...capabilities,
+							extensions: { ...capabilities.extensions, [TASKS_EXTENSION]: {} },
 						},
-						lifetime: new AbortController(),
-					};
-				}
-			} else {
-				result = validateInitializeResult(
-					await this.requestInternal(
-						"initialize",
-						{ protocolVersion: preferredVersion, capabilities, clientInfo },
-						{},
-						true,
-					),
-				);
-				if (
-					result.protocolVersion === TASKS_PROTOCOL_VERSION ||
-					!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)
-				) {
-					throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
-				}
+					},
+					lifetime: new AbortController(),
+				};
 			}
 			this.protocolVersionValue = result.protocolVersion;
 			this.serverInfoValue = result.serverInfo;
 			this.serverCapabilitiesValue = result.capabilities;
 			this.instructionsValue = result.instructions;
-			if (!modern) {
-				transport.setProtocolVersion?.(result.protocolVersion);
-				await this.notifyInternal("notifications/initialized", undefined, true);
-			}
 			this.state = "connected";
+			this.subscribeToTools();
 			return result;
 		} catch (error) {
 			await this.close().catch(() => {});
@@ -335,7 +301,8 @@ export class McpClient {
 	}
 
 	notify(method: string, params?: Record<string, unknown>): Promise<void> {
-		return this.notifyInternal(method, params, false);
+		const transport = this.requireTransport(false);
+		return transport.send({ jsonrpc: "2.0", method, ...(params === undefined ? {} : { params }) });
 	}
 
 	setRequestHandler(method: string, handler: RequestHandler): () => void {
@@ -349,9 +316,16 @@ export class McpClient {
 		const listeners = this.notificationListeners.get(method) ?? new Set<NotificationListener>();
 		this.notificationListeners.set(method, listeners);
 		listeners.add(listener);
+		if (method === TOOLS_LIST_CHANGED) this.subscribeToTools();
 		return () => {
 			listeners.delete(listener);
-			if (listeners.size === 0) this.notificationListeners.delete(method);
+			if (listeners.size !== 0) return;
+			this.notificationListeners.delete(method);
+			if (method === TOOLS_LIST_CHANGED && this.toolSubscription) {
+				const subscription = this.toolSubscription;
+				this.toolSubscription = undefined;
+				subscription.controller.abort();
+			}
 		};
 	}
 
@@ -366,8 +340,31 @@ export class McpClient {
 		return () => this.closeListeners.delete(listener);
 	}
 
-	async ping(options: McpRequestOptions = {}): Promise<void> {
-		await this.request("ping", undefined, options);
+	private subscribeToTools(): void {
+		if (
+			this.state !== "connected" ||
+			this.toolSubscription ||
+			this.serverCapabilitiesValue?.tools?.listChanged !== true ||
+			!this.notificationListeners.has(TOOLS_LIST_CHANGED)
+		) {
+			return;
+		}
+		const subscription: ToolSubscription = { controller: new AbortController(), acknowledged: false };
+		this.toolSubscription = subscription;
+		const { signal } = subscription.controller;
+		void this.requestInternal(
+			"subscriptions/listen",
+			{ notifications: { toolsListChanged: true } },
+			{ signal },
+			false,
+			subscription,
+		)
+			.catch((error) => {
+				if (!signal.aborted && this.state === "connected") this.emitError(error);
+			})
+			.finally(() => {
+				if (this.toolSubscription === subscription) this.toolSubscription = undefined;
+			});
 	}
 
 	async listTools(options: McpRequestOptions = {}): Promise<Tool[]> {
@@ -569,31 +566,28 @@ export class McpClient {
 		params: Record<string, unknown> | undefined,
 		options: McpRequestOptions,
 		allowConnecting: boolean,
+		subscription?: ToolSubscription,
 	): Promise<unknown> {
 		const transport = this.requireTransport(allowConnecting);
 		if (options.signal?.aborted) throw new McpAbortError();
 		const id = this.nextRequestId++;
+		if (subscription) subscription.requestId = id;
 		const progressToken = options.onProgress ? id : undefined;
 		const metadata =
-			this.tasks && (method === "tools/call" || method.startsWith("tasks/"))
-				? this.tasks.metadata
-				: this.modernMetadata;
-		const requestParams =
-			metadata === undefined && progressToken === undefined
-				? params
-				: {
-						...params,
-						_meta: {
-							...(isObject(params?._meta) ? params._meta : {}),
-							...metadata,
-							...(progressToken === undefined ? {} : { progressToken }),
-						},
-					};
+			this.tasks && (method === "tools/call" || method.startsWith("tasks/")) ? this.tasks.metadata : this.metadata;
 		const message: JsonRpcRequest = {
 			jsonrpc: "2.0",
 			id,
 			method,
-			...(requestParams === undefined ? {} : { params: requestParams }),
+			params: {
+				...params,
+				_meta: {
+					...(isObject(params?._meta) ? params._meta : {}),
+					...metadata,
+					...(this.notificationListeners.has("notifications/message") ? { [LOG_LEVEL_META]: "info" } : {}),
+					...(progressToken === undefined ? {} : { progressToken }),
+				},
+			},
 		};
 		return new Promise<unknown>((resolve, reject) => {
 			const entry: PendingRequest = {
@@ -602,16 +596,9 @@ export class McpClient {
 				timeoutMs: options.timeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 				timer: undefined,
 				signal: options.signal,
-				// The spec forbids cancelling `initialize`.
 				onAbort: () =>
-					this.cancelPending(
-						id,
-						new McpAbortError(),
-						method !== "initialize",
-						String(options.signal?.reason ?? "Aborted"),
-					),
+					this.cancelPending(id, new McpAbortError(), true, String(options.signal?.reason ?? "Aborted")),
 				sendController: new AbortController(),
-				cancellable: method !== "initialize",
 				mayCreateTask: this.tasks !== undefined && method === "tools/call",
 				onProgress: options.onProgress,
 				progressToken,
@@ -626,18 +613,6 @@ export class McpClient {
 		});
 	}
 
-	private async notifyInternal(
-		method: string,
-		params: Record<string, unknown> | undefined,
-		allowConnecting: boolean,
-	): Promise<void> {
-		await this.requireTransport(allowConnecting).send({
-			jsonrpc: "2.0",
-			method,
-			...(params === undefined ? {} : { params }),
-		});
-	}
-
 	private requireTransport(allowConnecting: boolean): McpTransport {
 		if (this.transport && (this.state === "connected" || (allowConnecting && this.state === "connecting"))) {
 			return this.transport;
@@ -648,10 +623,6 @@ export class McpClient {
 	private handleMessage(message: JsonRpcMessage): void {
 		if (isJsonRpcResponse(message)) {
 			this.handleResponse(message);
-			return;
-		}
-		if (isJsonRpcRequest(message)) {
-			void this.handleRequest(message);
 			return;
 		}
 		if (isJsonRpcNotification(message)) {
@@ -685,41 +656,34 @@ export class McpClient {
 		else entry.resolve(message.result);
 	}
 
-	private async handleRequest(message: JsonRpcRequest): Promise<void> {
-		const transport = this.transport;
-		if (!transport) return;
-		const handler = this.requestHandlers.get(message.method);
-		if (!handler) {
-			await transport
-				.send({
-					jsonrpc: "2.0",
-					id: message.id,
-					error: { code: JSON_RPC_ERROR_CODES.methodNotFound, message: `Method not found: ${message.method}` },
-				})
-				.catch((error) => this.emitError(error));
-			return;
-		}
-		const controller = new AbortController();
-		this.incoming.set(message.id, controller);
-		try {
-			const result = await handler(message.params, { signal: controller.signal });
-			await transport.send({ jsonrpc: "2.0", id: message.id, result: result ?? {} });
-		} catch (error) {
-			const responseError =
-				error instanceof McpError
-					? { code: error.code, message: error.message, data: error.data }
-					: { code: JSON_RPC_ERROR_CODES.internalError, message: toError(error).message };
-			await transport
-				.send({ jsonrpc: "2.0", id: message.id, error: responseError })
-				.catch((sendError) => this.emitError(sendError));
-		} finally {
-			this.incoming.delete(message.id);
-		}
-	}
-
 	private handleNotification(method: string, params: unknown): void {
 		if (method === "notifications/progress") this.handleProgress(params);
-		else if (method === "notifications/cancelled") this.handleCancelled(params);
+		if (method === TOOLS_LIST_CHANGED || method === "notifications/subscriptions/acknowledged") {
+			const subscription = this.toolSubscription;
+			const metadata = isObject(params) && isObject(params._meta) ? params._meta : undefined;
+			const id = metadata?.[SUBSCRIPTION_ID_META];
+			if (!subscription || !isJsonRpcId(id) || id !== subscription.requestId) return;
+			if (method === TOOLS_LIST_CHANGED && !subscription.acknowledged) return;
+			if (method === "notifications/subscriptions/acknowledged") {
+				const notifications = isObject(params) ? params.notifications : undefined;
+				const entry = this.pending.get(id);
+				if (!entry || !isObject(notifications) || notifications.toolsListChanged !== true) {
+					subscription.controller.abort();
+					return;
+				}
+				subscription.acknowledged = true;
+				clearTimeout(entry.timer);
+				entry.timer = undefined;
+			}
+		}
+		if (
+			method === "notifications/cancelled" &&
+			isObject(params) &&
+			isJsonRpcId(params.requestId) &&
+			params.requestId === this.toolSubscription?.requestId
+		) {
+			this.cancelPending(params.requestId, new McpAbortError(), false);
+		}
 		for (const listener of this.notificationListeners.get(method) ?? []) {
 			try {
 				listener(params);
@@ -742,15 +706,11 @@ export class McpClient {
 		}
 	}
 
-	private handleCancelled(params: unknown): void {
-		if (isObject(params) && isJsonRpcId(params.requestId)) this.incoming.get(params.requestId)?.abort(params.reason);
-	}
-
 	private armTimeout(id: JsonRpcId, entry: PendingRequest): void {
-		if (entry.timer) clearTimeout(entry.timer);
+		clearTimeout(entry.timer);
 		if (!Number.isFinite(entry.timeoutMs) || entry.timeoutMs <= 0) return;
 		entry.timer = setTimeout(() => {
-			this.cancelPending(id, new McpTimeoutError(entry.timeoutMs), entry.cancellable, "Request timed out");
+			this.cancelPending(id, new McpTimeoutError(entry.timeoutMs), true, "Request timed out");
 		}, entry.timeoutMs);
 	}
 
@@ -758,7 +718,7 @@ export class McpClient {
 		const entry = this.pending.get(id);
 		if (!entry) return;
 		const transport = this.transport;
-		const streamCancellation = this.modernMetadata && transport?.modernRequestCancellation === "stream";
+		const streamCancellation = transport?.requestCancellation === "stream";
 		if (notifyServer && entry.mayCreateTask && !streamCancellation) {
 			// Over stdio, the task handle can still arrive after the original request was cancelled.
 			this.lateTasks ??= new Map();
@@ -798,7 +758,7 @@ export class McpClient {
 		this.markClosed(new McpConnectionClosedError());
 	}
 
-	/** Idempotent: rejects in-flight requests, aborts server requests we are serving, and flips the state. */
+	/** Idempotent: rejects pending requests, ends polling, and flips the state. */
 	private markClosed(error: Error): void {
 		const wasClosed = this.state === "closed";
 		this.state = "closed";
@@ -808,8 +768,6 @@ export class McpClient {
 			this.lateTasks.clear();
 		}
 		this.rejectPending(error);
-		for (const controller of this.incoming.values()) controller.abort(error);
-		this.incoming.clear();
 		if (wasClosed) return;
 		for (const listener of [...this.closeListeners]) {
 			try {
